@@ -35,6 +35,7 @@ typedef struct {
 } td_rdma_server_conn_t;
 
 int td_tcp_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len);
+static int td_rdma_wait_response(td_rdma_impl_t *impl, td_wire_msg_t *response, char *err, size_t err_len);
 
 static int td_rdma_post_recv(td_rdma_impl_t *impl, char *err, size_t err_len) {
     struct ibv_sge sge;
@@ -265,31 +266,23 @@ static int td_rdma_client_write(td_session_t *session, size_t offset, const void
 
 static int td_rdma_client_cas(td_session_t *session, size_t offset, uint64_t compare, uint64_t swap, uint64_t *old_value, char *err, size_t err_len) {
     td_rdma_impl_t *impl = (td_rdma_impl_t *)session->impl;
-    struct ibv_sge sge;
-    struct ibv_send_wr wr;
-    struct ibv_send_wr *bad_wr = NULL;
+    td_wire_msg_t request;
+    td_wire_msg_t response;
 
-    *impl->cas_buf = 0;
-    memset(&sge, 0, sizeof(sge));
-    sge.addr = (uintptr_t)impl->cas_buf;
-    sge.length = sizeof(uint64_t);
-    sge.lkey = impl->cas_mr->lkey;
+    memset(&request, 0, sizeof(request));
+    request.magic = TD_WIRE_MAGIC;
+    request.op = TD_WIRE_CAS;
+    request.offset = offset;
+    request.compare = compare;
+    request.swap = swap;
 
-    memset(&wr, 0, sizeof(wr));
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.atomic.remote_addr = session->remote_addr + offset;
-    wr.wr.atomic.rkey = session->rkey;
-    wr.wr.atomic.compare_add = compare;
-    wr.wr.atomic.swap = swap;
-
-    if (ibv_post_send(impl->id->qp, &wr, &bad_wr) != 0 || td_rdma_poll_wc(impl, IBV_WC_COMP_SWAP, err, err_len) != 0) {
-        td_format_error(err, err_len, "rdma cas op failed");
+    if (td_rdma_send_control(impl, &request, err, err_len) != 0 ||
+        td_rdma_wait_response(impl, &response, err, err_len) != 0 ||
+        response.status != 0) {
+        td_format_error(err, err_len, "rdma cas control failed");
         return -1;
     }
-    *old_value = *impl->cas_buf;
+    *old_value = response.compare;
     return 0;
 }
 
@@ -479,6 +472,10 @@ static void *td_rdma_server_conn_main(void *arg) {
                 response.header = *conn->region->header;
                 response.remote_addr = (uint64_t)(uintptr_t)conn->region->base;
                 response.rkey = conn->region_mr->rkey;
+            } else if (request.op == TD_WIRE_CAS) {
+                if (td_region_cas64(conn->region, (size_t)request.offset, request.compare, request.swap, &response.compare) != 0) {
+                    response.status = 1;
+                }
             } else if (request.op == TD_WIRE_EVICT) {
                 td_region_evict_if_needed(conn->region, conn->eviction_threshold_pct);
             } else if (request.op == TD_WIRE_CLOSE) {
@@ -576,9 +573,9 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                     conn->stop_flag = stop_flag;
                     if (td_rdma_setup_qp(&conn->impl, sizeof(td_slot_t), err, err_len) == 0) {
                         conn->region_mr = ibv_reg_mr(conn->impl.pd, region->base, region->mapped_bytes,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
                         if (conn->region_mr == NULL) {
-                            td_format_error(err, err_len, "ibv_reg_mr failed");
+                            td_format_error(err, err_len, "ibv_reg_mr failed: %s", strerror(errno));
                         }
                     }
                     if (conn->region_mr != NULL && td_rdma_post_recv(&conn->impl, err, err_len) == 0) {
@@ -597,7 +594,7 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                                 td_format_error(err, err_len, "pthread_create failed");
                             }
                         } else {
-                            td_format_error(err, err_len, "rdma_accept failed");
+                            td_format_error(err, err_len, "rdma_accept failed: %s", strerror(errno));
                         }
                     }
                     if (conn != NULL) {
