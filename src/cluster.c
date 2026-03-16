@@ -238,6 +238,43 @@ int td_cluster_init(td_cluster_t *cluster, const td_config_t *cfg, char *err, si
     return 0;
 }
 
+int td_cluster_read_kv(td_cluster_t *cluster, const char *key, unsigned char *value, size_t *value_len, int *found, char *err, size_t err_len) {
+    return td_cluster_read_value(cluster, key, value, value_len, found, err, err_len);
+}
+
+int td_cluster_write_kv(td_cluster_t *cluster, const char *key, const unsigned char *value, size_t value_len, int *rule_out, char *err, size_t err_len) {
+    int rule = td_cluster_write_value(cluster, key, value, value_len, 0, 0, err, err_len);
+    if (rule < 0) {
+        return -1;
+    }
+    if (rule_out != NULL) {
+        *rule_out = rule;
+    }
+    return 0;
+}
+
+int td_cluster_update_kv(td_cluster_t *cluster, const char *key, const unsigned char *value, size_t value_len, int *rule_out, char *err, size_t err_len) {
+    int rule = td_cluster_write_value(cluster, key, value, value_len, 1, 0, err, err_len);
+    if (rule < 0) {
+        return -1;
+    }
+    if (rule_out != NULL) {
+        *rule_out = rule;
+    }
+    return 0;
+}
+
+int td_cluster_delete_kv(td_cluster_t *cluster, const char *key, int *rule_out, char *err, size_t err_len) {
+    int rule = td_cluster_write_value(cluster, key, (const unsigned char *)"", 0, 0, 1, err, err_len);
+    if (rule < 0) {
+        return -1;
+    }
+    if (rule_out != NULL) {
+        *rule_out = rule;
+    }
+    return 0;
+}
+
 void td_cluster_close(td_cluster_t *cluster) {
     size_t idx;
     for (idx = 0; idx < cluster->session_count; ++idx) {
@@ -322,7 +359,7 @@ int td_cluster_execute(td_cluster_t *cluster, const char *line, FILE *out) {
         unsigned char value[TD_MAX_VALUE_SIZE + 1];
         size_t value_len = 0;
         int found = 0;
-        if (td_cluster_read_value(cluster, arg1, value, &value_len, &found, err, sizeof(err)) != 0) {
+        if (td_cluster_read_kv(cluster, arg1, value, &value_len, &found, err, sizeof(err)) != 0) {
             fprintf(out, "error: %s\n", err);
             return 1;
         }
@@ -342,8 +379,11 @@ int td_cluster_execute(td_cluster_t *cluster, const char *line, FILE *out) {
 
     if (strcmp(cmd, "write") == 0 || strcmp(cmd, "update") == 0) {
         uint64_t start = td_now_ns();
-        int rule = td_cluster_write_value(cluster, arg1, (const unsigned char *)arg2, strlen(arg2), strcmp(cmd, "update") == 0, 0, err, sizeof(err));
-        if (rule < 0) {
+        int rule = 0;
+        int rc = strcmp(cmd, "update") == 0
+            ? td_cluster_update_kv(cluster, arg1, (const unsigned char *)arg2, strlen(arg2), &rule, err, sizeof(err))
+            : td_cluster_write_kv(cluster, arg1, (const unsigned char *)arg2, strlen(arg2), &rule, err, sizeof(err));
+        if (rc != 0) {
             fprintf(out, "error: %s\n", err);
             return 1;
         }
@@ -353,8 +393,8 @@ int td_cluster_execute(td_cluster_t *cluster, const char *line, FILE *out) {
 
     if (strcmp(cmd, "delete") == 0) {
         uint64_t start = td_now_ns();
-        int rule = td_cluster_write_value(cluster, arg1, (const unsigned char *)"", 0, 0, 1, err, sizeof(err));
-        if (rule < 0) {
+        int rule = 0;
+        if (td_cluster_delete_kv(cluster, arg1, &rule, err, sizeof(err)) != 0) {
             fprintf(out, "error: %s\n", err);
             return 1;
         }

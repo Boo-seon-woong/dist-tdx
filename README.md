@@ -34,6 +34,12 @@ MN 3개를 먼저 띄운다.
 ./bin/cn --config build/config/cn.conf
 ```
 
+CN 벤치마크는 아래처럼 실행한다.
+
+```bash
+./bin/cn_bench --config build/config/cn.conf --workload read --iterations 1000 --bytes 32 --warmup 128
+```
+
 REPL 명령:
 
 - `read key`
@@ -51,3 +57,4 @@ REPL 명령:
 - `src/transport_tcp.c`: persistent TCP session 및 MN 제어 서버
 - `src/transport_rdma.c`: `rdma_cm` + verbs 기반 persistent RDMA session
 - `src/test/`: smoke / cache 비교 스크립트
+- `benchmark/`: CN-side workload benchmark 안내와 소스
