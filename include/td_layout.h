@@ -45,17 +45,17 @@ size_t td_region_required_bytes(const td_config_t *cfg);
 int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err, size_t err_len);
 void td_region_close(td_local_region_t *region);
 
+size_t td_region_kind_slot_count(const td_region_header_t *header, td_region_kind_t kind);
 size_t td_region_kind_base_offset(const td_region_header_t *header, td_region_kind_t kind);
 size_t td_region_slot_offset(const td_region_header_t *header, td_region_kind_t kind, uint64_t key_hash);
 size_t td_region_slot_index(const td_region_header_t *header, td_region_kind_t kind, uint64_t key_hash);
+size_t td_region_slot_offset_for_index(const td_region_header_t *header, td_region_kind_t kind, size_t slot_index);
 td_slot_t *td_region_slot_ptr(td_local_region_t *region, td_region_kind_t kind, size_t slot_index);
 
 int td_region_read_bytes(td_local_region_t *region, size_t offset, void *buf, size_t len);
 int td_region_write_bytes(td_local_region_t *region, size_t offset, const void *buf, size_t len);
 int td_region_cas64(td_local_region_t *region, size_t offset, uint64_t compare, uint64_t swap, uint64_t *old_value);
 
-int td_region_read_slot(td_local_region_t *region, td_region_kind_t kind, uint64_t key_hash, td_slot_t *slot);
-int td_region_commit_slot(td_local_region_t *region, td_region_kind_t kind, uint64_t key_hash, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch);
 size_t td_region_count_cache_usage(td_local_region_t *region);
 void td_region_evict_if_needed(td_local_region_t *region, size_t threshold_pct);
 

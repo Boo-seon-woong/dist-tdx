@@ -29,6 +29,16 @@ typedef struct {
     const char *workload_name;
 } td_bench_stats_t;
 
+typedef struct {
+    const char *phase_name;
+    size_t total;
+    uint64_t next_report_ns;
+} td_bench_progress_t;
+
+enum {
+    TD_BENCH_PROGRESS_INTERVAL_NS = 10000000000ULL
+};
+
 static void td_bench_usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s --config <path> --workload <write|read|update|delete> [--iterations N] [--bytes N] [--warmup N] [--key-prefix prefix]\n",
@@ -117,12 +127,71 @@ static void td_bench_fill_value(unsigned char *buf, size_t bytes, size_t seed) {
 }
 
 static void td_bench_make_key(char *buf, size_t buf_len, const td_bench_options_t *opts, size_t idx) {
-    snprintf(buf, buf_len, "%s-%s-%08zu", opts->key_prefix, opts->workload_name, idx);
+    const size_t reserved = sizeof("-") - 1 + sizeof("-00000000") - 1;
+    size_t available;
+    size_t prefix_len;
+    size_t workload_len;
+    int written;
+
+    if (buf_len == 0) {
+        return;
+    }
+    if (buf_len <= reserved) {
+        buf[0] = '\0';
+        return;
+    }
+
+    available = buf_len - reserved - 1;
+    prefix_len = strlen(opts->key_prefix);
+    if (prefix_len > available / 2) {
+        prefix_len = available / 2;
+    }
+    workload_len = strlen(opts->workload_name);
+    if (workload_len > available - prefix_len) {
+        workload_len = available - prefix_len;
+    }
+
+    written = snprintf(buf, buf_len, "%.*s-%.*s-%08zu",
+        (int)prefix_len,
+        opts->key_prefix,
+        (int)workload_len,
+        opts->workload_name,
+        idx);
+    if (written < 0 || (size_t)written >= buf_len) {
+        buf[buf_len - 1] = '\0';
+    }
+}
+
+static void td_bench_progress_begin(td_bench_progress_t *progress, const char *phase_name, size_t total) {
+    progress->phase_name = phase_name;
+    progress->total = total;
+    progress->next_report_ns = td_now_ns() + TD_BENCH_PROGRESS_INTERVAL_NS;
+}
+
+static void td_bench_progress_maybe_report(td_bench_progress_t *progress, size_t completed) {
+    uint64_t now;
+
+    if (progress->total == 0) {
+        return;
+    }
+
+    now = td_now_ns();
+    if (now < progress->next_report_ns) {
+        return;
+    }
+
+    fprintf(stderr, "progress: %s %zu/%zu\n", progress->phase_name, completed, progress->total);
+    while (progress->next_report_ns <= now) {
+        progress->next_report_ns += TD_BENCH_PROGRESS_INTERVAL_NS;
+    }
 }
 
 static int td_bench_seed_keys(td_cluster_t *cluster, const td_bench_options_t *opts, unsigned char *value, char *err, size_t err_len) {
     size_t idx;
     size_t seed_count = opts->iterations + opts->warmup_iterations;
+    td_bench_progress_t progress;
+
+    td_bench_progress_begin(&progress, "seed", seed_count);
 
     for (idx = 0; idx < seed_count; ++idx) {
         char key[TD_KEY_BYTES];
@@ -132,16 +201,20 @@ static int td_bench_seed_keys(td_cluster_t *cluster, const td_bench_options_t *o
         if (td_cluster_write_kv(cluster, key, value, opts->bytes, &rule, err, err_len) != 0) {
             return -1;
         }
+        td_bench_progress_maybe_report(&progress, idx + 1);
     }
     return 0;
 }
 
 static int td_bench_warmup(td_cluster_t *cluster, const td_bench_options_t *opts, unsigned char *value, char *err, size_t err_len) {
     size_t idx;
+    td_bench_progress_t progress;
 
     if (opts->warmup_iterations == 0) {
         return 0;
     }
+
+    td_bench_progress_begin(&progress, "warmup", opts->warmup_iterations);
 
     for (idx = 0; idx < opts->warmup_iterations; ++idx) {
         char key[TD_KEY_BYTES];
@@ -179,6 +252,7 @@ static int td_bench_warmup(td_cluster_t *cluster, const td_bench_options_t *opts
                 }
                 break;
         }
+        td_bench_progress_maybe_report(&progress, idx + 1);
     }
     return 0;
 }
@@ -267,6 +341,7 @@ static int td_bench_run(td_cluster_t *cluster, const td_bench_options_t *opts, t
     size_t idx;
     unsigned char value[TD_MAX_VALUE_SIZE];
     unsigned char read_buf[TD_MAX_VALUE_SIZE];
+    td_bench_progress_t progress;
     stats->samples_ns = (uint64_t *)calloc(opts->iterations, sizeof(*stats->samples_ns));
     stats->count = opts->iterations;
     stats->bytes = opts->bytes;
@@ -284,6 +359,8 @@ static int td_bench_run(td_cluster_t *cluster, const td_bench_options_t *opts, t
     if (td_bench_warmup(cluster, opts, value, err, err_len) != 0) {
         return -1;
     }
+
+    td_bench_progress_begin(&progress, "benchmark", opts->iterations);
 
     for (idx = 0; idx < opts->iterations; ++idx) {
         char key[TD_KEY_BYTES];
@@ -320,6 +397,7 @@ static int td_bench_run(td_cluster_t *cluster, const td_bench_options_t *opts, t
                 break;
         }
         stats->samples_ns[idx] = td_now_ns() - start_ns;
+        td_bench_progress_maybe_report(&progress, idx + 1);
     }
     return 0;
 }

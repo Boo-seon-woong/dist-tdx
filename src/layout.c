@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static size_t td_region_slot_count(const td_region_header_t *header, td_region_kind_t kind) {
+size_t td_region_kind_slot_count(const td_region_header_t *header, td_region_kind_t kind) {
     switch (kind) {
         case TD_REGION_PRIME:
             return (size_t)header->prime_slot_count;
@@ -108,12 +108,16 @@ size_t td_region_kind_base_offset(const td_region_header_t *header, td_region_ki
 }
 
 size_t td_region_slot_index(const td_region_header_t *header, td_region_kind_t kind, uint64_t key_hash) {
-    size_t count = td_region_slot_count(header, kind);
+    size_t count = td_region_kind_slot_count(header, kind);
     return count == 0 ? 0 : (size_t)(key_hash % count);
 }
 
+size_t td_region_slot_offset_for_index(const td_region_header_t *header, td_region_kind_t kind, size_t slot_index) {
+    return td_region_kind_base_offset(header, kind) + (slot_index * sizeof(td_slot_t));
+}
+
 size_t td_region_slot_offset(const td_region_header_t *header, td_region_kind_t kind, uint64_t key_hash) {
-    return td_region_kind_base_offset(header, kind) + (td_region_slot_index(header, kind, key_hash) * sizeof(td_slot_t));
+    return td_region_slot_offset_for_index(header, kind, td_region_slot_index(header, kind, key_hash));
 }
 
 td_slot_t *td_region_slot_ptr(td_local_region_t *region, td_region_kind_t kind, size_t slot_index) {
@@ -161,20 +165,6 @@ int td_region_cas64(td_local_region_t *region, size_t offset, uint64_t compare, 
         *old_value = observed;
     }
     return 0;
-}
-
-int td_region_read_slot(td_local_region_t *region, td_region_kind_t kind, uint64_t key_hash, td_slot_t *slot) {
-    return td_region_read_bytes(region, td_region_slot_offset(region->header, kind, key_hash), slot, sizeof(*slot));
-}
-
-int td_region_commit_slot(td_local_region_t *region, td_region_kind_t kind, uint64_t key_hash, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch) {
-    size_t slot_offset = td_region_slot_offset(region->header, kind, key_hash);
-    size_t body_offset = slot_offset + offsetof(td_slot_t, visible_epoch);
-
-    if (td_region_write_bytes(region, body_offset, &slot->visible_epoch, sizeof(td_slot_t) - offsetof(td_slot_t, visible_epoch)) != 0) {
-        return -1;
-    }
-    return td_region_cas64(region, slot_offset, compare_epoch, slot->visible_epoch, observed_epoch);
 }
 
 size_t td_region_count_cache_usage(td_local_region_t *region) {

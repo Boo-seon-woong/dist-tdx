@@ -12,6 +12,23 @@ typedef struct {
     uint64_t observed_tie;
 } td_vote_t;
 
+typedef struct {
+    td_slot_t slot;
+    size_t slot_index;
+    int found;
+    int tombstone;
+    td_slot_t candidate_slot;
+    size_t candidate_slot_index;
+    int candidate_valid;
+} td_slot_probe_t;
+
+static int td_slot_is_empty(const td_slot_t *slot) {
+    return slot->guard_epoch == 0 &&
+           slot->visible_epoch == 0 &&
+           slot->key_hash == 0 &&
+           slot->flags == 0;
+}
+
 static int td_slot_present(const td_slot_t *slot, uint64_t key_hash) {
     return slot->guard_epoch == slot->visible_epoch &&
            slot->key_hash == key_hash &&
@@ -19,13 +36,13 @@ static int td_slot_present(const td_slot_t *slot, uint64_t key_hash) {
            (slot->flags & TD_SLOT_FLAG_TOMBSTONE) == 0;
 }
 
-static int td_fetch_slot(td_session_t *session, td_region_kind_t kind, uint64_t key_hash, td_slot_t *slot, char *err, size_t err_len) {
-    size_t offset = td_region_slot_offset(&session->header, kind, key_hash);
+static int td_fetch_slot_at(td_session_t *session, td_region_kind_t kind, size_t slot_index, td_slot_t *slot, char *err, size_t err_len) {
+    size_t offset = td_region_slot_offset_for_index(&session->header, kind, slot_index);
     return session->read_region(session, offset, slot, sizeof(*slot), err, err_len);
 }
 
-static int td_commit_slot(td_session_t *session, td_region_kind_t kind, uint64_t key_hash, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch, char *err, size_t err_len) {
-    size_t slot_offset = td_region_slot_offset(&session->header, kind, key_hash);
+static int td_commit_slot_at(td_session_t *session, td_region_kind_t kind, size_t slot_index, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch, char *err, size_t err_len) {
+    size_t slot_offset = td_region_slot_offset_for_index(&session->header, kind, slot_index);
     size_t body_offset = slot_offset + offsetof(td_slot_t, visible_epoch);
     size_t body_len = sizeof(td_slot_t) - offsetof(td_slot_t, visible_epoch);
 
@@ -33,6 +50,66 @@ static int td_commit_slot(td_session_t *session, td_region_kind_t kind, uint64_t
         return -1;
     }
     return session->cas64(session, slot_offset, compare_epoch, slot->visible_epoch, observed_epoch, err, err_len);
+}
+
+static int td_probe_slot(td_session_t *session, td_region_kind_t kind, uint64_t key_hash, td_slot_probe_t *probe, char *err, size_t err_len) {
+    size_t count = td_region_kind_slot_count(&session->header, kind);
+    size_t home = td_region_slot_index(&session->header, kind, key_hash);
+    size_t idx;
+
+    memset(probe, 0, sizeof(*probe));
+    if (count == 0) {
+        td_format_error(err, err_len, "region kind %d has no slots", kind);
+        return -1;
+    }
+
+    for (idx = 0; idx < count; ++idx) {
+        size_t slot_index = (home + idx) % count;
+        td_slot_t slot;
+
+        if (td_fetch_slot_at(session, kind, slot_index, &slot, err, err_len) != 0) {
+            return -1;
+        }
+
+        if (slot.guard_epoch != slot.visible_epoch) {
+            continue;
+        }
+
+        if ((slot.flags & TD_SLOT_FLAG_VALID) != 0 && slot.key_hash == key_hash) {
+            probe->slot = slot;
+            probe->slot_index = slot_index;
+            probe->found = 1;
+            probe->tombstone = (slot.flags & TD_SLOT_FLAG_TOMBSTONE) != 0;
+            probe->candidate_slot = slot;
+            probe->candidate_slot_index = slot_index;
+            probe->candidate_valid = 1;
+            return 0;
+        }
+
+        if ((slot.flags & TD_SLOT_FLAG_VALID) != 0 && (slot.flags & TD_SLOT_FLAG_TOMBSTONE) != 0) {
+            if (!probe->candidate_valid) {
+                probe->candidate_slot = slot;
+                probe->candidate_slot_index = slot_index;
+                probe->candidate_valid = 1;
+            }
+            continue;
+        }
+
+        if (td_slot_is_empty(&slot)) {
+            if (!probe->candidate_valid) {
+                probe->candidate_slot = slot;
+                probe->candidate_slot_index = slot_index;
+                probe->candidate_valid = 1;
+            }
+            return 0;
+        }
+    }
+
+    if (!probe->candidate_valid) {
+        td_format_error(err, err_len, "region kind %d is full for key hash %llu", kind, (unsigned long long)key_hash);
+        return -1;
+    }
+    return 0;
 }
 
 static td_session_t *td_primary_session(td_cluster_t *cluster, uint64_t key_hash) {
@@ -50,8 +127,9 @@ static int td_wait_for_primary_change(td_cluster_t *cluster, uint64_t key_hash, 
     char err[256];
 
     for (attempts = 0; attempts < 50; ++attempts) {
-        td_slot_t slot;
-        if (td_fetch_slot(primary, TD_REGION_PRIME, key_hash, &slot, err, sizeof(err)) == 0 && slot.guard_epoch != old_epoch) {
+        td_slot_probe_t probe;
+        if (td_probe_slot(primary, TD_REGION_PRIME, key_hash, &probe, err, sizeof(err)) == 0 &&
+            (!probe.found || probe.slot.guard_epoch != old_epoch)) {
             return 0;
         }
         usleep(10000);
@@ -61,7 +139,7 @@ static int td_wait_for_primary_change(td_cluster_t *cluster, uint64_t key_hash, 
 
 static void td_refresh_cache_best_effort(td_cluster_t *cluster, const char *key, const td_slot_t *slot) {
     td_session_t *primary = td_primary_session(cluster, td_hash64_string(key));
-    td_slot_t cache_slot;
+    td_slot_probe_t probe;
     uint64_t observed = 0;
     char err[256];
     uint64_t key_hash = td_hash64_string(key);
@@ -69,44 +147,46 @@ static void td_refresh_cache_best_effort(td_cluster_t *cluster, const char *key,
     if (cluster->config.cache == TD_CACHE_OFF) {
         return;
     }
-    if (td_fetch_slot(primary, TD_REGION_CACHE, key_hash, &cache_slot, err, sizeof(err)) != 0) {
+    if (td_probe_slot(primary, TD_REGION_CACHE, key_hash, &probe, err, sizeof(err)) != 0 || !probe.candidate_valid) {
         return;
     }
-    (void)td_commit_slot(primary, TD_REGION_CACHE, key_hash, slot, cache_slot.guard_epoch, &observed, err, sizeof(err));
+    (void)td_commit_slot_at(primary, TD_REGION_CACHE, probe.candidate_slot_index, slot, probe.candidate_slot.guard_epoch, &observed, err, sizeof(err));
 }
 
 static int td_cluster_read_value(td_cluster_t *cluster, const char *key, unsigned char *value, size_t *value_len, int *found, char *err, size_t err_len) {
     td_session_t *primary;
     uint64_t key_hash = td_hash64_string(key);
-    td_slot_t prime;
-    td_slot_t cache;
+    td_slot_probe_t prime_probe;
+    td_slot_probe_t cache_probe;
 
     *found = 0;
     primary = td_primary_session(cluster, key_hash);
 
-    if (td_fetch_slot(primary, TD_REGION_PRIME, key_hash, &prime, err, err_len) != 0) {
+    if (td_probe_slot(primary, TD_REGION_PRIME, key_hash, &prime_probe, err, err_len) != 0) {
         return -1;
     }
 
     if (cluster->config.cache == TD_CACHE_ON) {
-        if (td_fetch_slot(primary, TD_REGION_CACHE, key_hash, &cache, err, err_len) == 0 &&
-            cache.guard_epoch == prime.guard_epoch &&
-            cache.visible_epoch == prime.visible_epoch &&
-            td_slot_present(&cache, key_hash) &&
-            td_crypto_decode_slot(&cluster->crypto, key, &cache, value, value_len) == 0) {
+        if (td_probe_slot(primary, TD_REGION_CACHE, key_hash, &cache_probe, err, err_len) == 0 &&
+            cache_probe.found &&
+            prime_probe.found &&
+            cache_probe.slot.guard_epoch == prime_probe.slot.guard_epoch &&
+            cache_probe.slot.visible_epoch == prime_probe.slot.visible_epoch &&
+            td_slot_present(&cache_probe.slot, key_hash) &&
+            td_crypto_decode_slot(&cluster->crypto, key, &cache_probe.slot, value, value_len) == 0) {
             *found = 1;
             return 0;
         }
     }
 
-    if (!td_slot_present(&prime, key_hash)) {
+    if (!prime_probe.found || !td_slot_present(&prime_probe.slot, key_hash)) {
         return 0;
     }
-    if (td_crypto_decode_slot(&cluster->crypto, key, &prime, value, value_len) != 0) {
+    if (td_crypto_decode_slot(&cluster->crypto, key, &prime_probe.slot, value, value_len) != 0) {
         td_format_error(err, err_len, "mac verification failed for key %s", key);
         return -1;
     }
-    td_refresh_cache_best_effort(cluster, key, &prime);
+    td_refresh_cache_best_effort(cluster, key, &prime_probe.slot);
     *found = 1;
     return 0;
 }
@@ -139,7 +219,7 @@ static int td_evaluate_votes(td_vote_t *votes, size_t backup_count, uint64_t my_
 static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const unsigned char *value, size_t value_len, int update_only, int tombstone, char *err, size_t err_len) {
     uint64_t key_hash = td_hash64_string(key);
     td_session_t *primary = td_primary_session(cluster, key_hash);
-    td_slot_t current;
+    td_slot_probe_t primary_probe;
     td_slot_t proposal;
     td_vote_t votes[TD_MAX_ENDPOINTS];
     size_t replica_count = (size_t)cluster->config.replication;
@@ -155,11 +235,11 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
     backup_count = replica_count > 0 ? replica_count - 1 : 0;
     memset(votes, 0, sizeof(votes));
 
-    if (td_fetch_slot(primary, TD_REGION_PRIME, key_hash, &current, err, err_len) != 0) {
+    if (td_probe_slot(primary, TD_REGION_PRIME, key_hash, &primary_probe, err, err_len) != 0) {
         return -1;
     }
-    current_epoch = current.guard_epoch;
-    if (update_only && !td_slot_present(&current, key_hash)) {
+    current_epoch = primary_probe.candidate_slot.guard_epoch;
+    if (update_only && (!primary_probe.found || primary_probe.tombstone || !td_slot_present(&primary_probe.slot, key_hash))) {
         td_format_error(err, err_len, "update failed: key %s not found", key);
         return -1;
     }
@@ -178,18 +258,18 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
 
     for (idx = 0; idx < backup_count; ++idx) {
         td_session_t *backup = td_replica_session(cluster, key_hash, idx + 1);
-        td_slot_t prior;
+        td_slot_probe_t probe;
         uint64_t prior_epoch = 0;
-        if (td_fetch_slot(backup, TD_REGION_BACKUP, key_hash, &prior, err, err_len) != 0) {
+        if (td_probe_slot(backup, TD_REGION_BACKUP, key_hash, &probe, err, err_len) != 0 || !probe.candidate_valid) {
             return -1;
         }
-        prior_epoch = prior.guard_epoch;
-        if (td_commit_slot(backup, TD_REGION_BACKUP, key_hash, &proposal, prior_epoch, &observed, err, err_len) == 0 &&
+        prior_epoch = probe.candidate_slot.guard_epoch;
+        if (td_commit_slot_at(backup, TD_REGION_BACKUP, probe.candidate_slot_index, &proposal, prior_epoch, &observed, err, err_len) == 0 &&
             observed == prior_epoch) {
             votes[idx].success = 1;
         } else {
             votes[idx].observed_epoch = observed;
-            votes[idx].observed_tie = prior.tie_breaker;
+            votes[idx].observed_tie = probe.candidate_slot.tie_breaker;
         }
     }
 
@@ -200,7 +280,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
         return -1;
     }
 
-    if (td_commit_slot(primary, TD_REGION_PRIME, key_hash, &proposal, current_epoch, &observed, err, err_len) != 0 ||
+    if (td_commit_slot_at(primary, TD_REGION_PRIME, primary_probe.candidate_slot_index, &proposal, current_epoch, &observed, err, err_len) != 0 ||
         observed != current_epoch) {
         td_format_error(err, err_len, "primary CAS failed for key %s", key);
         return -1;
@@ -209,9 +289,9 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
     for (idx = 0; idx < backup_count; ++idx) {
         if (!votes[idx].success) {
             td_session_t *backup = td_replica_session(cluster, key_hash, idx + 1);
-            td_slot_t prior;
-            if (td_fetch_slot(backup, TD_REGION_BACKUP, key_hash, &prior, err, err_len) == 0) {
-                (void)td_commit_slot(backup, TD_REGION_BACKUP, key_hash, &proposal, prior.guard_epoch, &observed, err, err_len);
+            td_slot_probe_t probe;
+            if (td_probe_slot(backup, TD_REGION_BACKUP, key_hash, &probe, err, err_len) == 0 && probe.candidate_valid) {
+                (void)td_commit_slot_at(backup, TD_REGION_BACKUP, probe.candidate_slot_index, &proposal, probe.candidate_slot.guard_epoch, &observed, err, err_len);
             }
         }
     }
