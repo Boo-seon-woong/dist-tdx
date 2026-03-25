@@ -85,7 +85,7 @@ For example, if MN listens on `7301`, launch the guest with:
   `run_td --tcp-hostfwd-ports 7301`
 
 - external CN case:
-  `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr 10.20.26.87`
+  `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr <run_td-host-ip>`
 
 Then the host CN uses:
 
@@ -93,7 +93,14 @@ Then the host CN uses:
 
 Then an external CN uses:
 
-- `mn_endpoint: 10.20.26.87:7301`
+- `mn_endpoint: <run_td-host-ip>:7301`
+
+In the current deployment:
+
+- `run_td` runs on `simba`
+- the TDX guest therefore physically lives on `simba`
+- `genie` is an external CN/SM server
+- the bootstrap endpoint must therefore target `simba` rather than `genie`
 
 `vsock` bootstrap remains available as an optional path, but it must not be assumed. In some QEMU/TDX combinations the host fails to route to the guest CID even when `vhost-vsock-pci` is configured.
 

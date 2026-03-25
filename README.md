@@ -56,7 +56,10 @@ For `transport: rdma` with `rdma_bootstrap: tcp`:
 - `listen_host` / `listen_port`: TCP bootstrap listener on the MN side
 - `mn_endpoint`: TCP bootstrap endpoint on the CN side
 - for same-host testing, `run_td --tcp-hostfwd-ports 7301` lets the host CN use `mn_endpoint: 127.0.0.1:7301`
-- for an external CN server, bind the forward on the host's reachable management IP, for example `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr 10.20.26.87`, then use `mn_endpoint: 10.20.26.87:7301`
+- for an external CN server, bind the forward on the host that actually runs `run_td`; in the current deployment that host is `simba`, so use `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr 10.20.18.199`, then point the CN to `mn_endpoint: 10.20.18.199:7301`
+- sample files:
+  `build/config/cn.rdma.local*.conf` are for same-host testing on the `run_td` host
+  `build/config/cn.rdma*.conf` currently match the `genie` CN to `simba` TDX-host deployment
 
 For `transport: rdma` with `rdma_bootstrap: vsock`:
 
