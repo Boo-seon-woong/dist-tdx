@@ -1240,6 +1240,7 @@ static int td_rdma_open_control_client(const td_endpoint_t *endpoint, char *err,
     struct addrinfo *it;
     char port[16];
     int fd = -1;
+    int last_errno = 0;
 
     /* Exchange RC QP attributes over a normal TCP socket so data plane RDMA stays off rdma_cm/IPoIB. */
     memset(&hints, 0, sizeof(hints));
@@ -1261,13 +1262,17 @@ static int td_rdma_open_control_client(const td_endpoint_t *endpoint, char *err,
             td_rdma_tune_socket(fd);
             break;
         }
+        last_errno = errno;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(result);
 
     if (fd < 0) {
-        td_format_error(err, err_len, "cannot connect RDMA bootstrap endpoint %s:%d", endpoint->host, endpoint->port);
+        td_format_error(err, err_len, "cannot connect RDMA bootstrap endpoint %s:%d: %s",
+            endpoint->host,
+            endpoint->port,
+            last_errno != 0 ? strerror(last_errno) : "unknown error");
         return -1;
     }
     return fd;
@@ -1294,8 +1299,13 @@ static int td_rdma_open_control_client_vsock(const td_endpoint_t *endpoint, char
     addr.svm_port = (unsigned int)endpoint->port;
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int saved_errno = errno;
+
         close(fd);
-        td_format_error(err, err_len, "cannot connect RDMA vsock bootstrap endpoint cid=%u port=%d", cid, endpoint->port);
+        td_format_error(err, err_len, "cannot connect RDMA vsock bootstrap endpoint cid=%u port=%d: %s",
+            cid,
+            endpoint->port,
+            strerror(saved_errno));
         return -1;
     }
     return fd;
@@ -1513,9 +1523,18 @@ static int td_rdma_open_control_listener_vsock(const td_config_t *cfg, char *err
     addr.svm_cid = VMADDR_CID_ANY;
     addr.svm_port = (unsigned int)cfg->listen_port;
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listen_fd, 16) != 0) {
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int saved_errno = errno;
+
         close(listen_fd);
-        td_format_error(err, err_len, "RDMA vsock bootstrap bind/listen failed on port %d", cfg->listen_port);
+        td_format_error(err, err_len, "RDMA vsock bootstrap bind failed on port %d: %s", cfg->listen_port, strerror(saved_errno));
+        return -1;
+    }
+    if (listen(listen_fd, 16) != 0) {
+        int saved_errno = errno;
+
+        close(listen_fd);
+        td_format_error(err, err_len, "RDMA vsock bootstrap listen failed on port %d: %s", cfg->listen_port, strerror(saved_errno));
         return -1;
     }
 
