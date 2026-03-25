@@ -3,7 +3,7 @@ Objective
 Refactor `dist-td` into `dist-tdx` so that an MN running inside an Intel TDX guest can keep one-sided RDMA semantics without violating the TDX memory model.
 
 The problem is not "how to do RDMA through TDCALL".
-The problem is "how to expose only the correct memory to RDMA while the MN stays TDX-isolated".
+The problem is "how to expose only the correct memory to RDMA while the MN stays TDX-isolated and while the connection model does not depend on IPoIB".
 
 1. Ground Truth
 
@@ -24,7 +24,7 @@ Therefore:
 
 - IPoIB is optional
 - RDMA data path must not depend on IPoIB
-- `rdma_cm` over IP is not the core transport model anymore
+- `rdma_cm` over IP is not the core transport model
 
 1.2 Absolute Rules
 
@@ -39,9 +39,9 @@ Therefore:
 
 Control/bootstrap plane:
 
-- ordinary TCP socket
+- default: file-based OOB rendezvous
+- optional fallback: TCP bootstrap
 - used only to exchange RC QP connection attributes
-- may use any reachable management IP network
 
 RDMA data plane:
 
@@ -60,18 +60,40 @@ That assumption breaks in the target deployment where:
 
 So the design must become:
 
-1. bootstrap over TCP
-2. exchange `{LID, QPN, PSN, MTU, optional GID}`
-3. move QP `INIT -> RTR -> RTS`
-4. close the bootstrap socket
-5. perform RDMA and control operations over verbs
+1. exchange `{LID, QPN, PSN, MTU, optional GID}` through an OOB channel
+2. move QP `INIT -> RTR -> RTS`
+3. perform RDMA and control operations directly over verbs
 
-2.3 Config semantics
+2.3 OOB file rendezvous
 
-Under `transport: rdma`:
+The default automated OOB mechanism is a shared directory visible to both CN and MN.
 
-- `listen_host` / `listen_port` mean "bootstrap listener", not "RDMA CM listener"
-- `mn_endpoint` means "bootstrap endpoint", not "IPoIB data-plane address"
+Flow:
+
+1. CN creates a request record for a target `mn_node_id`
+2. MN polls the shared directory for requests addressed to its `node_id`
+3. MN creates its local QP state and publishes a response record
+4. CN reads the response record and completes QP transition
+
+This removes the requirement that CN and MN share a reachable IP bootstrap path.
+
+2.4 Config semantics
+
+Under `transport: rdma` and `rdma_bootstrap: file`:
+
+- `rdma_oob_dir` is mandatory
+- `node_id` is mandatory on the MN
+- `mn_node_id` entries are mandatory on the CN
+- `listen_host` / `listen_port` are irrelevant
+- `mn_endpoint` is irrelevant
+
+Under `transport: rdma` and `rdma_bootstrap: tcp`:
+
+- `listen_host` / `listen_port` mean bootstrap listener
+- `mn_endpoint` means bootstrap endpoint
+
+Shared RDMA settings:
+
 - `rdma_device` may be either:
   - a verbs device name such as `mlx5_0`
   - a netdev alias such as `ibp1s0` or `ibs3`
@@ -179,7 +201,7 @@ Do rely on:
 - `ibv_create_cq`
 - `ibv_create_qp`
 - `ibv_modify_qp`
-- direct exchange of QP attributes over bootstrap TCP
+- OOB exchange of QP attributes
 
 5.3 Control-path rule
 
@@ -202,9 +224,11 @@ Implemented:
 - shared slot header/body separation
 - RDMA-visible local buffers moved onto the shared allocator path
 - region header slimmed to remote-visible layout only
-- manual verbs RC setup with TCP bootstrap exchange
+- manual verbs RC setup
 - support for resolving `rdma_device` from either verbs device names or IB netdev aliases
 - `rdma_port_num` config
+- file-based OOB bootstrap using a shared rendezvous directory
+- optional TCP bootstrap retained as fallback
 - real `tdcall` probe backend gated by `TDX_REAL_TDCALL=1`
 
 Not a goal of the current code:
@@ -226,18 +250,34 @@ Reality:
 - only IPoIB is down
 - verbs RDMA may still be fully available if `ibstat` is active
 
-7.2 Wrong transport assumption
+7.2 Wrong bootstrap assumption
 
 Symptom:
 
-- CN/MN config uses IP endpoint as if it were the RDMA path itself
+- CN/MN config still assumes RDMA requires an IP address
 
 Fix:
 
-- treat it as bootstrap/control only
-- keep RDMA data plane on verbs RC over the active fabric
+- use `rdma_bootstrap: file`
+- use `rdma_oob_dir`
+- identify peers by `mn_node_id` / `node_id`
 
-7.3 Wrong memory assumption
+7.3 Wrong OOB assumption
+
+Symptom:
+
+- file bootstrap times out
+
+Root cause:
+
+- CN and MN are not actually looking at the same shared directory
+
+Fix:
+
+- mount or expose the same rendezvous directory to both systems
+- verify permissions and stale file cleanup
+
+7.4 Wrong memory assumption
 
 Symptom:
 
@@ -259,21 +299,22 @@ Phase 1
 Phase 2
 
 - remove `rdma_cm`/IPoIB assumptions from RDMA transport
-- adopt TCP bootstrap plus manual verbs QP connection
+- adopt OOB exchange of QP state
 
 Phase 3
 
 - tighten fail-fast behavior around TDX runtime expectations
-- improve deployment observability for resolved RDMA device/port/bootstrap endpoint
+- improve deployment observability for resolved RDMA device/port/OOB path
 
 Phase 4
 
 - performance tuning
-- optional transport/bootstrap hardening
+- optional additional OOB backends if a shared directory is not available
 
 9. Key Takeaways
 
 - The critical distinction is fabric-level RDMA vs IPoIB
 - The RDMA data plane must work without IPoIB
-- The control/bootstrap plane may still use ordinary TCP
+- QP setup still needs an OOB exchange path
+- In this refactor, the default OOB path is a shared directory rather than TCP
 - The core problem remains memory-model correctness inside TDX

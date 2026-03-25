@@ -33,6 +33,11 @@ typedef enum {
 } td_transport_t;
 
 typedef enum {
+    TD_RDMA_BOOTSTRAP_TCP = 0,
+    TD_RDMA_BOOTSTRAP_OOB_FILE = 1,
+} td_rdma_bootstrap_t;
+
+typedef enum {
     TD_CACHE_OFF = 0,
     TD_CACHE_ON = 1,
 } td_cache_mode_t;

@@ -12,8 +12,12 @@ typedef struct td_config {
     size_t mn_memory_size;
     char encryption_key_hex[(TD_KEY_MATERIAL_BYTES * 2) + 1];
     char rdma_device[TD_HOST_BYTES];
+    td_rdma_bootstrap_t rdma_bootstrap;
     int rdma_gid_index;
     int rdma_port_num;
+    char rdma_oob_dir[TD_PATH_BYTES];
+    size_t rdma_oob_poll_ms;
+    size_t rdma_oob_timeout_ms;
     char listen_host[TD_HOST_BYTES];
     int listen_port;
     int node_id;

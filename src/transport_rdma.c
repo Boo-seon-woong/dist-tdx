@@ -11,11 +11,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
     TD_RDMA_BOOTSTRAP_MAGIC = 0x54444253u,
     TD_RDMA_BOOTSTRAP_VERSION = 1,
+    TD_RDMA_OOB_MAGIC = 0x54444f42u,
+    TD_RDMA_OOB_VERSION = 1,
+    TD_RDMA_OOB_REQUEST = 1,
+    TD_RDMA_OOB_RESPONSE = 2,
 };
 
 typedef struct {
@@ -35,6 +40,16 @@ typedef struct {
     uint16_t reserved;
     td_rdma_conn_info_t conn;
 } td_rdma_bootstrap_msg_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+    int32_t target_node_id;
+    int32_t source_node_id;
+    uint64_t session_id;
+    td_rdma_conn_info_t conn;
+} td_rdma_oob_record_t;
 
 typedef struct {
     struct ibv_context *verbs;
@@ -129,6 +144,144 @@ static int td_recv_all(int fd, void *buf, size_t len) {
         }
         cursor += (size_t)read_bytes;
         len -= (size_t)read_bytes;
+    }
+    return 0;
+}
+
+static void td_rdma_sleep_ms(size_t ms) {
+    struct timespec ts;
+
+    ts.tv_sec = (time_t)(ms / 1000);
+    ts.tv_nsec = (long)((ms % 1000) * 1000000ULL);
+    nanosleep(&ts, NULL);
+}
+
+static uint64_t td_rdma_make_session_id(int target_node_id) {
+    static uint64_t seq = 0;
+
+    seq += 1;
+    return td_now_ns() ^ ((uint64_t)(uint32_t)getpid() << 16) ^ (uint64_t)(uint32_t)(target_node_id + 1) ^ seq;
+}
+
+static int td_rdma_format_oob_path(const char *dir, const char *kind, int target_node_id, uint64_t session_id, char *path, size_t path_len) {
+    int written;
+
+    written = snprintf(path, path_len, "%s/rdma-%s.mn%d.sid%016llx.bin",
+        dir,
+        kind,
+        target_node_id,
+        (unsigned long long)session_id);
+    return written > 0 && (size_t)written < path_len ? 0 : -1;
+}
+
+static int td_rdma_parse_oob_request_name(const char *name, int *target_node_id, uint64_t *session_id) {
+    static const char prefix[] = "rdma-req.mn";
+    const char *cursor = name + sizeof(prefix) - 1;
+    char *end = NULL;
+    unsigned long parsed_target;
+    unsigned long long parsed_session;
+
+    if (strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return -1;
+    }
+    errno = 0;
+    parsed_target = strtoul(cursor, &end, 10);
+    if (errno != 0 || end == cursor || strncmp(end, ".sid", 4) != 0) {
+        return -1;
+    }
+    cursor = end + 4;
+    errno = 0;
+    parsed_session = strtoull(cursor, &end, 16);
+    if (errno != 0 || end == cursor || strcmp(end, ".bin") != 0) {
+        return -1;
+    }
+    if (target_node_id != NULL) {
+        *target_node_id = (int)parsed_target;
+    }
+    if (session_id != NULL) {
+        *session_id = (uint64_t)parsed_session;
+    }
+    return 0;
+}
+
+static int td_rdma_write_binary_file(const char *path, const void *data, size_t data_len, char *err, size_t err_len) {
+    char temp_path[TD_PATH_BYTES * 2];
+    FILE *fp = NULL;
+
+    if (snprintf(temp_path, sizeof(temp_path), "%s.tmp.%ld", path, (long)getpid()) >= (int)sizeof(temp_path)) {
+        td_format_error(err, err_len, "rdma oob temp path too long");
+        return -1;
+    }
+
+    fp = fopen(temp_path, "wb");
+    if (fp == NULL) {
+        td_format_error(err, err_len, "cannot open rdma oob temp file %s", temp_path);
+        return -1;
+    }
+    if (fwrite(data, 1, data_len, fp) != data_len || fflush(fp) != 0) {
+        fclose(fp);
+        unlink(temp_path);
+        td_format_error(err, err_len, "cannot write rdma oob temp file %s", temp_path);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        unlink(temp_path);
+        td_format_error(err, err_len, "cannot close rdma oob temp file %s", temp_path);
+        return -1;
+    }
+    if (rename(temp_path, path) != 0) {
+        unlink(temp_path);
+        td_format_error(err, err_len, "cannot publish rdma oob file %s", path);
+        return -1;
+    }
+    return 0;
+}
+
+static int td_rdma_read_binary_file(const char *path, void *data, size_t data_len, int missing_ok, char *err, size_t err_len) {
+    FILE *fp = NULL;
+
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        if (missing_ok && errno == ENOENT) {
+            return 1;
+        }
+        td_format_error(err, err_len, "cannot open rdma oob file %s", path);
+        return -1;
+    }
+    if (fread(data, 1, data_len, fp) != data_len) {
+        fclose(fp);
+        td_format_error(err, err_len, "cannot read rdma oob file %s", path);
+        return -1;
+    }
+    if (fgetc(fp) != EOF) {
+        fclose(fp);
+        td_format_error(err, err_len, "rdma oob file %s has unexpected trailing bytes", path);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int td_rdma_validate_oob_record(const td_rdma_oob_record_t *record, uint16_t expected_kind, int target_node_id, uint64_t session_id, char *err, size_t err_len) {
+    if (record->magic != TD_RDMA_OOB_MAGIC) {
+        td_format_error(err, err_len, "rdma oob magic mismatch");
+        return -1;
+    }
+    if (record->version != TD_RDMA_OOB_VERSION) {
+        td_format_error(err, err_len, "rdma oob version mismatch");
+        return -1;
+    }
+    if (record->kind != expected_kind) {
+        td_format_error(err, err_len, "rdma oob kind mismatch");
+        return -1;
+    }
+    if (record->target_node_id != target_node_id) {
+        td_format_error(err, err_len, "rdma oob target node mismatch");
+        return -1;
+    }
+    if (record->session_id != session_id) {
+        td_format_error(err, err_len, "rdma oob session mismatch");
+        return -1;
     }
     return 0;
 }
@@ -556,6 +709,158 @@ static int td_rdma_validate_bootstrap(const td_rdma_bootstrap_msg_t *msg, char *
     return 0;
 }
 
+static int td_rdma_wait_oob_response(const td_config_t *cfg, int target_node_id, uint64_t session_id, td_rdma_oob_record_t *response, char *err, size_t err_len) {
+    char response_path[TD_PATH_BYTES];
+    uint64_t deadline_ns;
+
+    if (td_rdma_format_oob_path(cfg->rdma_oob_dir, "rsp", target_node_id, session_id, response_path, sizeof(response_path)) != 0) {
+        td_format_error(err, err_len, "rdma oob response path too long");
+        return -1;
+    }
+
+    deadline_ns = td_now_ns() + (cfg->rdma_oob_timeout_ms * 1000000ULL);
+    while (td_now_ns() < deadline_ns) {
+        int rc = td_rdma_read_binary_file(response_path, response, sizeof(*response), 1, err, err_len);
+
+        if (rc == 0) {
+            if (td_rdma_validate_oob_record(response, TD_RDMA_OOB_RESPONSE, target_node_id, session_id, err, err_len) != 0) {
+                unlink(response_path);
+                return -1;
+            }
+            unlink(response_path);
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+        td_rdma_sleep_ms(cfg->rdma_oob_poll_ms);
+    }
+
+    td_format_error(err, err_len, "timed out waiting for rdma oob response for node %d", target_node_id);
+    return -1;
+}
+
+static int td_rdma_exchange_client_bootstrap_oob_file(const td_config_t *cfg, const td_endpoint_t *endpoint, td_rdma_impl_t *impl, char *err, size_t err_len) {
+    td_rdma_oob_record_t request;
+    td_rdma_oob_record_t response;
+    char request_path[TD_PATH_BYTES];
+    uint64_t session_id = td_rdma_make_session_id(endpoint->node_id);
+
+    memset(&request, 0, sizeof(request));
+    request.magic = TD_RDMA_OOB_MAGIC;
+    request.version = TD_RDMA_OOB_VERSION;
+    request.kind = TD_RDMA_OOB_REQUEST;
+    request.target_node_id = endpoint->node_id;
+    request.source_node_id = cfg->node_id;
+    request.session_id = session_id;
+    if (td_rdma_query_local_conn_info(impl, &request.conn, err, err_len) != 0) {
+        return -1;
+    }
+    if (td_rdma_format_oob_path(cfg->rdma_oob_dir, "req", endpoint->node_id, session_id, request_path, sizeof(request_path)) != 0) {
+        td_format_error(err, err_len, "rdma oob request path too long");
+        return -1;
+    }
+    if (td_rdma_write_binary_file(request_path, &request, sizeof(request), err, err_len) != 0) {
+        return -1;
+    }
+    if (td_rdma_wait_oob_response(cfg, endpoint->node_id, session_id, &response, err, err_len) != 0) {
+        unlink(request_path);
+        return -1;
+    }
+    unlink(request_path);
+    if (td_rdma_qp_to_rtr(impl, &response.conn, err, err_len) != 0 ||
+        td_rdma_qp_to_rts(impl, err, err_len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int td_rdma_claim_oob_request(const td_config_t *cfg, td_rdma_oob_record_t *request, char *claimed_request_path, size_t claimed_request_path_len, char *response_path, size_t response_path_len, char *err, size_t err_len) {
+    DIR *dir = NULL;
+    struct dirent *entry;
+
+    dir = opendir(cfg->rdma_oob_dir);
+    if (dir == NULL) {
+        td_format_error(err, err_len, "cannot open rdma oob dir %s", cfg->rdma_oob_dir);
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char request_path[TD_PATH_BYTES];
+        int target_node_id = -1;
+        uint64_t session_id = 0;
+
+        if (td_rdma_parse_oob_request_name(entry->d_name, &target_node_id, &session_id) != 0 || target_node_id != cfg->node_id) {
+            continue;
+        }
+        if (td_rdma_format_oob_path(cfg->rdma_oob_dir, "req", target_node_id, session_id, request_path, sizeof(request_path)) != 0) {
+            continue;
+        }
+        if (snprintf(claimed_request_path, claimed_request_path_len, "%s.claim.%ld", request_path, (long)getpid()) >= (int)claimed_request_path_len) {
+            closedir(dir);
+            td_format_error(err, err_len, "rdma oob claimed request path too long");
+            return -1;
+        }
+        if (rename(request_path, claimed_request_path) != 0) {
+            continue;
+        }
+        if (td_rdma_read_binary_file(claimed_request_path, request, sizeof(*request), 0, err, err_len) != 0 ||
+            td_rdma_validate_oob_record(request, TD_RDMA_OOB_REQUEST, cfg->node_id, request->session_id, err, err_len) != 0) {
+            unlink(claimed_request_path);
+            continue;
+        }
+        if (td_rdma_format_oob_path(cfg->rdma_oob_dir, "rsp", request->target_node_id, request->session_id, response_path, response_path_len) != 0) {
+            unlink(claimed_request_path);
+            closedir(dir);
+            td_format_error(err, err_len, "rdma oob response path too long");
+            return -1;
+        }
+        closedir(dir);
+        return 0;
+    }
+
+    closedir(dir);
+    return 1;
+}
+
+static int td_rdma_wait_oob_request(const td_config_t *cfg, volatile sig_atomic_t *stop_flag, td_rdma_oob_record_t *request, char *claimed_request_path, size_t claimed_request_path_len, char *response_path, size_t response_path_len, char *err, size_t err_len) {
+    for (;;) {
+        int rc;
+
+        if (*stop_flag) {
+            return 1;
+        }
+        rc = td_rdma_claim_oob_request(cfg, request, claimed_request_path, claimed_request_path_len, response_path, response_path_len, err, err_len);
+        if (rc == 0 || rc < 0) {
+            return rc;
+        }
+        td_rdma_sleep_ms(cfg->rdma_oob_poll_ms);
+    }
+}
+
+static int td_rdma_exchange_server_bootstrap_oob_file(const td_config_t *cfg, const td_rdma_oob_record_t *request, const char *response_path, td_rdma_impl_t *impl, char *err, size_t err_len) {
+    td_rdma_oob_record_t response;
+
+    memset(&response, 0, sizeof(response));
+    response.magic = TD_RDMA_OOB_MAGIC;
+    response.version = TD_RDMA_OOB_VERSION;
+    response.kind = TD_RDMA_OOB_RESPONSE;
+    response.target_node_id = request->target_node_id;
+    response.source_node_id = cfg->node_id;
+    response.session_id = request->session_id;
+    if (td_rdma_query_local_conn_info(impl, &response.conn, err, err_len) != 0) {
+        return -1;
+    }
+    if (td_rdma_qp_to_rtr(impl, &request->conn, err, err_len) != 0 ||
+        td_rdma_qp_to_rts(impl, err, err_len) != 0) {
+        return -1;
+    }
+    if (td_rdma_write_binary_file(response_path, &response, sizeof(response), err, err_len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char *err, size_t err_len) {
     td_rdma_bootstrap_msg_t local_msg;
     td_rdma_bootstrap_msg_t remote_msg;
@@ -947,26 +1252,33 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     td_wire_msg_t response;
     int control_fd = -1;
 
-    control_fd = td_rdma_open_control_client(endpoint, err, err_len);
-    if (control_fd < 0) {
-        return -1;
-    }
-
     impl = (td_rdma_impl_t *)calloc(1, sizeof(*impl));
     if (impl == NULL) {
-        close(control_fd);
         td_format_error(err, err_len, "out of memory");
         return -1;
     }
+    if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP) {
+        control_fd = td_rdma_open_control_client(endpoint, err, err_len);
+        if (control_fd < 0) {
+            free(impl);
+            return -1;
+        }
+    }
     if (td_rdma_setup_impl(impl, cfg, sizeof(td_slot_t), err, err_len) != 0 ||
         td_rdma_post_recv(impl, err, err_len) != 0 ||
-        td_rdma_exchange_client_bootstrap(control_fd, impl, err, err_len) != 0) {
-        close(control_fd);
+        (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP
+            ? td_rdma_exchange_client_bootstrap(control_fd, impl, err, err_len)
+            : td_rdma_exchange_client_bootstrap_oob_file(cfg, endpoint, impl, err, err_len)) != 0) {
+        if (control_fd >= 0) {
+            close(control_fd);
+        }
         td_rdma_destroy_impl(impl);
         free(impl);
         return -1;
     }
-    close(control_fd);
+    if (control_fd >= 0) {
+        close(control_fd);
+    }
 
     memset(&hello, 0, sizeof(hello));
     hello.magic = TD_WIRE_MAGIC;
@@ -1129,8 +1441,75 @@ static int td_rdma_open_control_listener(const td_config_t *cfg, char *err, size
     return listen_fd;
 }
 
+static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t *region, volatile sig_atomic_t *stop_flag, char *err, size_t err_len) {
+    while (!(*stop_flag)) {
+        td_rdma_oob_record_t request;
+        char claimed_request_path[TD_PATH_BYTES * 2];
+        char response_path[TD_PATH_BYTES];
+        int wait_rc;
+
+        wait_rc = td_rdma_wait_oob_request(cfg, stop_flag, &request, claimed_request_path, sizeof(claimed_request_path), response_path, sizeof(response_path), err, err_len);
+        if (wait_rc > 0) {
+            return 0;
+        }
+        if (wait_rc < 0) {
+            return -1;
+        }
+
+        {
+            td_rdma_server_conn_t *conn = (td_rdma_server_conn_t *)calloc(1, sizeof(*conn));
+            pthread_t thread;
+
+            if (conn == NULL) {
+                unlink(claimed_request_path);
+                td_format_error(err, err_len, "out of memory");
+                return -1;
+            }
+            conn->region = region;
+            conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
+            conn->stop_flag = stop_flag;
+            if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), err, err_len) == 0 &&
+                td_rdma_post_recv(&conn->impl, err, err_len) == 0 &&
+                td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, err, err_len) == 0) {
+                conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+                if (conn->region_mr == NULL) {
+                    td_format_error(err, err_len, "ibv_reg_mr failed: %s", strerror(errno));
+                }
+            }
+            unlink(claimed_request_path);
+            if (conn->region_mr != NULL) {
+                if (pthread_create(&thread, NULL, td_rdma_server_conn_main, conn) == 0) {
+                    pthread_detach(thread);
+                    conn = NULL;
+                } else {
+                    td_format_error(err, err_len, "pthread_create failed");
+                }
+            } else {
+                unlink(response_path);
+            }
+            if (conn != NULL) {
+                if (conn->region_mr != NULL) {
+                    ibv_dereg_mr(conn->region_mr);
+                    conn->region_mr = NULL;
+                }
+                unlink(response_path);
+                td_rdma_destroy_impl(&conn->impl);
+                free(conn);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volatile sig_atomic_t *stop_flag, char *err, size_t err_len) {
     int listen_fd;
+
+    if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
+        return td_rdma_server_run_oob_file(cfg, region, stop_flag, err, err_len);
+    }
 
     listen_fd = td_rdma_open_control_listener(cfg, err, err_len);
     if (listen_fd < 0) {
@@ -1190,6 +1569,10 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                     }
                 }
                 if (conn != NULL) {
+                    if (conn->region_mr != NULL) {
+                        ibv_dereg_mr(conn->region_mr);
+                        conn->region_mr = NULL;
+                    }
                     td_rdma_destroy_impl(&conn->impl);
                     free(conn);
                 }

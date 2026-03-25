@@ -32,6 +32,18 @@ static int td_parse_transport(const char *value, td_transport_t *out) {
     return -1;
 }
 
+static int td_parse_rdma_bootstrap(const char *value, td_rdma_bootstrap_t *out) {
+    if (strcmp(value, "tcp") == 0) {
+        *out = TD_RDMA_BOOTSTRAP_TCP;
+        return 0;
+    }
+    if (strcmp(value, "file") == 0 || strcmp(value, "oob_file") == 0) {
+        *out = TD_RDMA_BOOTSTRAP_OOB_FILE;
+        return 0;
+    }
+    return -1;
+}
+
 static int td_parse_toggle(const char *value, int *out) {
     if (strcmp(value, "on") == 0) {
         *out = 1;
@@ -253,14 +265,18 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->tdx = TD_TDX_OFF;
     cfg->cache = TD_CACHE_ON;
     cfg->mn_memory_size = 64ULL * 1024ULL * 1024ULL;
+    cfg->rdma_bootstrap = TD_RDMA_BOOTSTRAP_OOB_FILE;
     cfg->rdma_gid_index = 0;
     cfg->rdma_port_num = 1;
+    cfg->rdma_oob_poll_ms = 100;
+    cfg->rdma_oob_timeout_ms = 30000;
     cfg->listen_port = 0;
     cfg->node_id = -1;
     cfg->max_value_size = TD_MAX_VALUE_SIZE;
     cfg->eviction_threshold_pct = 80;
     cfg->recv_queue_depth = TD_RECV_QUEUE_DEPTH;
     snprintf(cfg->rdma_device, sizeof(cfg->rdma_device), "%s", "mlx5_0");
+    snprintf(cfg->rdma_oob_dir, sizeof(cfg->rdma_oob_dir), "%s", "");
     snprintf(cfg->listen_host, sizeof(cfg->listen_host), "%s", "0.0.0.0");
     snprintf(cfg->memory_file, sizeof(cfg->memory_file), "%s", "/tmp/dist-td-mn.dat");
 }
@@ -339,16 +355,46 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
             snprintf(cfg->encryption_key_hex, sizeof(cfg->encryption_key_hex), "%s", value);
         } else if (strcmp(key, "rdma_device") == 0) {
             snprintf(cfg->rdma_device, sizeof(cfg->rdma_device), "%s", value);
+        } else if (strcmp(key, "rdma_bootstrap") == 0) {
+            if (td_parse_rdma_bootstrap(value, &cfg->rdma_bootstrap) != 0) {
+                td_format_error(err, err_len, "invalid rdma_bootstrap at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
         } else if (strcmp(key, "rdma_gid_index") == 0) {
             cfg->rdma_gid_index = atoi(value);
         } else if (strcmp(key, "rdma_port_num") == 0) {
             cfg->rdma_port_num = atoi(value);
+        } else if (strcmp(key, "rdma_oob_dir") == 0) {
+            snprintf(cfg->rdma_oob_dir, sizeof(cfg->rdma_oob_dir), "%s", value);
+        } else if (strcmp(key, "rdma_oob_poll_ms") == 0) {
+            cfg->rdma_oob_poll_ms = (size_t)strtoull(value, NULL, 10);
+        } else if (strcmp(key, "rdma_oob_timeout_ms") == 0) {
+            cfg->rdma_oob_timeout_ms = (size_t)strtoull(value, NULL, 10);
         } else if (strcmp(key, "listen_host") == 0) {
             snprintf(cfg->listen_host, sizeof(cfg->listen_host), "%s", value);
         } else if (strcmp(key, "listen_port") == 0) {
             cfg->listen_port = atoi(value);
         } else if (strcmp(key, "node_id") == 0) {
             cfg->node_id = atoi(value);
+        } else if (strcmp(key, "mn_node_id") == 0) {
+            int node_id = atoi(value);
+
+            if (cfg->mn_count >= TD_MAX_ENDPOINTS) {
+                td_format_error(err, err_len, "too many mn_node_id values");
+                fclose(fp);
+                return -1;
+            }
+            if (node_id < 0) {
+                td_format_error(err, err_len, "invalid mn_node_id at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
+            memset(&cfg->mn_endpoints[cfg->mn_count], 0, sizeof(cfg->mn_endpoints[cfg->mn_count]));
+            snprintf(cfg->mn_endpoints[cfg->mn_count].host, sizeof(cfg->mn_endpoints[cfg->mn_count].host), "node-%d", node_id);
+            cfg->mn_endpoints[cfg->mn_count].port = 0;
+            cfg->mn_endpoints[cfg->mn_count].node_id = node_id;
+            ++cfg->mn_count;
         } else if (strcmp(key, "memory_file") == 0) {
             snprintf(cfg->memory_file, sizeof(cfg->memory_file), "%s", value);
         } else if (strcmp(key, "prime_slots") == 0) {
@@ -414,19 +460,50 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
         return -1;
     }
     if (cfg->mode == TD_MODE_CN && cfg->mn_count == 0) {
-        td_format_error(err, err_len, "cn config requires at least one mn_endpoint");
+        td_format_error(err, err_len, "cn config requires at least one mn_endpoint or mn_node_id");
         return -1;
     }
     if (cfg->mode == TD_MODE_MN && cfg->tdx != TD_TDX_ON) {
         td_format_error(err, err_len, "mn config requires tdx: on");
         return -1;
     }
-    if (cfg->mode == TD_MODE_MN && cfg->listen_port <= 0) {
-        td_format_error(err, err_len, "mn config requires listen_port");
-        return -1;
-    }
     if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_port_num <= 0) {
         td_format_error(err, err_len, "rdma_port_num must be greater than zero");
+        return -1;
+    }
+    if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
+        if (cfg->rdma_oob_dir[0] == '\0') {
+            td_format_error(err, err_len, "rdma transport with file bootstrap requires rdma_oob_dir");
+            return -1;
+        }
+        if (cfg->rdma_oob_poll_ms == 0) {
+            td_format_error(err, err_len, "rdma_oob_poll_ms must be greater than zero");
+            return -1;
+        }
+        if (cfg->rdma_oob_timeout_ms == 0) {
+            td_format_error(err, err_len, "rdma_oob_timeout_ms must be greater than zero");
+            return -1;
+        }
+        if (cfg->mode == TD_MODE_MN && cfg->node_id < 0) {
+            td_format_error(err, err_len, "mn config with file bootstrap requires node_id");
+            return -1;
+        }
+        if (cfg->mode == TD_MODE_CN) {
+            size_t idx;
+
+            for (idx = 0; idx < cfg->mn_count; ++idx) {
+                if (cfg->mn_endpoints[idx].node_id < 0) {
+                    td_format_error(err, err_len, "cn config with file bootstrap requires mn_node_id entries");
+                    return -1;
+                }
+            }
+        }
+    }
+    if (cfg->transport == TD_TRANSPORT_RDMA &&
+        cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP &&
+        cfg->mode == TD_MODE_MN &&
+        cfg->listen_port <= 0) {
+        td_format_error(err, err_len, "mn config with tcp bootstrap requires listen_port");
         return -1;
     }
     if (cfg->mode == TD_MODE_MN && td_resolve_mn_slots(cfg, err, err_len) != 0) {

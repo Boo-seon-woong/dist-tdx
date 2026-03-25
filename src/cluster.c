@@ -784,15 +784,25 @@ void td_cluster_print_status(td_cluster_t *cluster, FILE *out) {
         cluster->session_count);
     for (idx = 0; idx < cluster->session_count; ++idx) {
         td_session_t *session = &cluster->sessions[idx];
-        fprintf(out, "mn[%zu] %s:%d node_id=%d prime=%llu cache=%llu backup=%llu bytes=%llu\n",
-            idx,
-            session->endpoint.host,
-            session->endpoint.port,
-            session->endpoint.node_id,
-            (unsigned long long)session->header.prime_slot_count,
-            (unsigned long long)session->header.cache_slot_count,
-            (unsigned long long)session->header.backup_slot_count,
-            (unsigned long long)session->header.region_size);
+        if (session->endpoint.host[0] != '\0' && session->endpoint.port > 0) {
+            fprintf(out, "mn[%zu] %s:%d node_id=%d prime=%llu cache=%llu backup=%llu bytes=%llu\n",
+                idx,
+                session->endpoint.host,
+                session->endpoint.port,
+                session->endpoint.node_id,
+                (unsigned long long)session->header.prime_slot_count,
+                (unsigned long long)session->header.cache_slot_count,
+                (unsigned long long)session->header.backup_slot_count,
+                (unsigned long long)session->header.region_size);
+        } else {
+            fprintf(out, "mn[%zu] node_id=%d prime=%llu cache=%llu backup=%llu bytes=%llu\n",
+                idx,
+                session->endpoint.node_id,
+                (unsigned long long)session->header.prime_slot_count,
+                (unsigned long long)session->header.cache_slot_count,
+                (unsigned long long)session->header.backup_slot_count,
+                (unsigned long long)session->header.region_size);
+        }
     }
 }
 
