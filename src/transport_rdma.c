@@ -1421,6 +1421,8 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         td_format_error(err, err_len, "out of memory");
         return -1;
     }
+    fprintf(stderr, "[DEBUG] connecting to %s:%d...\n", endpoint->host, endpoint->port);
+    fflush(stderr);
     if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) {
         control_fd = cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK
             ? td_rdma_open_control_client_vsock(endpoint, err, err_len)
@@ -1430,8 +1432,19 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
             return -1;
         }
     }
-    if (td_rdma_setup_impl(impl, cfg, sizeof(td_slot_t), err, err_len) != 0 ||
-        ((cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK)
+    fprintf(stderr, "[DEBUG] TCP connected, setting up QP...\n");
+    fflush(stderr);
+    if (td_rdma_setup_impl(impl, cfg, sizeof(td_slot_t), err, err_len) != 0) {
+        fprintf(stderr, "[DEBUG] setup_impl failed: %s\n", err);
+        fflush(stderr);
+        if (control_fd >= 0) close(control_fd);
+        td_rdma_destroy_impl(impl);
+        free(impl);
+        return -1;
+    }
+    fprintf(stderr, "[DEBUG] QP setup done, exchanging bootstrap...\n");
+    fflush(stderr);
+    if (((cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK)
             ? td_rdma_exchange_client_bootstrap(control_fd, impl, err, err_len)
             : td_rdma_exchange_client_bootstrap_oob_file(cfg, endpoint, impl, err, err_len)) != 0) {
         if (control_fd >= 0) {
@@ -1445,12 +1458,26 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         close(control_fd);
     }
 
+    fprintf(stderr, "[DEBUG] bootstrap done, local lid=%u qpn=%u psn=%u\n",
+            impl->lid, impl->qp->qp_num, impl->psn);
+    fflush(stderr);
+
     memset(&hello, 0, sizeof(hello));
     hello.magic = TD_WIRE_MAGIC;
     hello.op = TD_WIRE_HELLO;
 
-    if (td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0 ||
-        td_rdma_post_recv(impl, err, err_len) != 0 ||
+    fprintf(stderr, "[DEBUG] sending HELLO via RDMA...\n");
+    fflush(stderr);
+    if (td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0) {
+        fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+        fflush(stderr);
+        td_rdma_destroy_impl(impl);
+        free(impl);
+        return -1;
+    }
+    fprintf(stderr, "[DEBUG] HELLO send completed, posting recv and waiting for response...\n");
+    fflush(stderr);
+    if (td_rdma_post_recv(impl, err, err_len) != 0 ||
         td_rdma_wait_message(impl, &response, NULL, 0, NULL, NULL, NULL, NULL, NULL, err, err_len) != 0) {
         td_rdma_destroy_impl(impl);
         free(impl);
