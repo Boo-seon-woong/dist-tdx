@@ -254,6 +254,7 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->cache = TD_CACHE_ON;
     cfg->mn_memory_size = 64ULL * 1024ULL * 1024ULL;
     cfg->rdma_gid_index = 0;
+    cfg->rdma_port_num = 1;
     cfg->listen_port = 0;
     cfg->node_id = -1;
     cfg->max_value_size = TD_MAX_VALUE_SIZE;
@@ -340,6 +341,8 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
             snprintf(cfg->rdma_device, sizeof(cfg->rdma_device), "%s", value);
         } else if (strcmp(key, "rdma_gid_index") == 0) {
             cfg->rdma_gid_index = atoi(value);
+        } else if (strcmp(key, "rdma_port_num") == 0) {
+            cfg->rdma_port_num = atoi(value);
         } else if (strcmp(key, "listen_host") == 0) {
             snprintf(cfg->listen_host, sizeof(cfg->listen_host), "%s", value);
         } else if (strcmp(key, "listen_port") == 0) {
@@ -420,6 +423,10 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
     }
     if (cfg->mode == TD_MODE_MN && cfg->listen_port <= 0) {
         td_format_error(err, err_len, "mn config requires listen_port");
+        return -1;
+    }
+    if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_port_num <= 0) {
+        td_format_error(err, err_len, "rdma_port_num must be greater than zero");
         return -1;
     }
     if (cfg->mode == TD_MODE_MN && td_resolve_mn_slots(cfg, err, err_len) != 0) {

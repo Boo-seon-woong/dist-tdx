@@ -1,87 +1,52 @@
-# dist-td (TDX-enabled MN)
+# dist-tdx
 
-이 버전의 dist-td는 MN을 Intel TDX Trust Domain 내부에서 실행하도록 확장된 구조다.
+`dist-tdx` is the TDX-focused refactoring branch of `dist-td`.
 
-기존과 달리 MN은 shared/private memory를 구분하며, RDMA는 shared memory를 통해서만 접근된다.
+The main constraint is not "how to make RDMA work in TDX" but "how to expose only the correct memory to RDMA inside a TDX guest".
 
----
+## Current direction
 
-## 핵심 변경점
+- MN runs inside an Intel TDX guest.
+- CN remains outside the TDX trust boundary.
+- RDMA touches only the shared-exposed slot region and RDMA-visible local buffers.
+- MN metadata, eviction state, and other control-plane state stay private.
 
-### 1. Memory Model
+## RDMA connection model
 
-MN 내부 메모리는 두 가지로 나뉜다:
+RDMA data path no longer assumes `rdma_cm` or IPoIB.
 
-- Private Memory
-  - TD 내부에서만 접근 가능
-  - metadata, control state, eviction state
+- Data plane: manual verbs RC QP setup plus one-sided RDMA READ/WRITE.
+- Bootstrap/control plane: ordinary TCP socket used only to exchange QP attributes.
+- Required bootstrap data: `LID`, `QPN`, `PSN`, `MTU`, and `GID` when needed.
 
-- Shared Memory
-  - RDMA 및 VMM 접근 가능
-  - PRIME / CACHE / BACKUP slot 모두 여기에 존재
+Implication:
 
----
+- `ibstat` showing `State: Active` and a valid `SM lid` is enough for verbs-level RDMA setup on InfiniBand.
+- `ip link show` reporting the IB netdev as `DOWN` does not by itself block verbs RDMA.
+- IPoIB is not required unless a separate IP-based tool or protocol needs it.
 
-### 2. RDMA 접근 방식
+## Config meaning
 
-- RDMA는 **shared memory region만 접근 가능**
-- slot body read/write는 기존과 동일하게 one-sided RDMA 사용
-- MN CPU는 여전히 control path(CAS 등)만 처리
+- `listen_host` / `listen_port`: TCP bootstrap listener on the MN side.
+- `mn_endpoint`: TCP bootstrap endpoint on the CN side.
+- `rdma_device`: either a verbs device name such as `mlx5_0` or a netdev alias such as `ibp1s0` or `ibs3`.
+- `rdma_port_num`: verbs port number to use on that device.
+- `rdma_gid_index`: only needed when the fabric path requires a GRH/GID-based address.
 
----
+## TDX memory model
 
-### 3. TDCALL의 역할
+- Shared slot storage is separated from private metadata.
+- Slot header/body visible to RDMA remain in the shared region.
+- MN-only sidecar metadata remains private.
 
-TDCALL은 다음 경우에만 사용된다:
+Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers safe in Linux guests.
 
-- shared ↔ private memory conversion
-- TD-VMM communication (#VE handling 등)
-- MMIO/IO emulation
+- The code can probe TDX with a real `tdcall` backend when built with `TDX_REAL_TDCALL=1`.
+- Safe private/shared handling for DMA registration is left to the guest-kernel DMA/pinning path.
+- `td_tdx_map_shared_memory()` therefore represents the allocator contract for NIC-visible memory, not a promise that userspace completed a raw page conversion by itself.
 
-RDMA 데이터 path에는 사용되지 않는다.
+## Non-goals
 
----
-
-### 4. MN 역할 재정의
-
-기존:
-> MN = passive memory appliance
-
-변경:
-> MN = TDX-isolated memory appliance with shared memory exposure
-
----
-
-## 아키텍처
-
-CN (untrusted)
-  ↓ RDMA
-Shared Memory (MN inside TD)
-  ↓
-MN Private Logic (TD 내부)
-
----
-
-## Slot Layout
-
-모든 slot은 shared memory에 존재한다:
-
-PRIME / CACHE / BACKUP
-
-slot format은 기존과 동일하다.
-
----
-
-## Security Model
-
-- shared memory는 untrusted
-- CN은 여전히 암호화/MAC 책임 유지
-- MN은 plaintext 해석하지 않음
-
----
-
-## 중요한 제약
-
-- shared memory 접근 시 secure computation 금지
-- #VE handler 내부에서 secret 사용 금지
-- TDCALL은 retry loop 기반으로 호출해야 함
+- No TDCALL in the RDMA hot path.
+- No RDMA access to private metadata.
+- No dependency on IPoIB for the RDMA data plane.

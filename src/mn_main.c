@@ -143,13 +143,24 @@ int main(int argc, char **argv) {
     eviction_ctx.threshold_pct = cfg.eviction_threshold_pct;
     pthread_create(&evict_thread, NULL, td_eviction_thread, &eviction_ctx);
 
-    fprintf(stdout, "dist-td mn node_id=%d transport=%s listen=%s:%d backing=%s bytes=%llu\n",
-        cfg.node_id,
-        cfg.transport == TD_TRANSPORT_RDMA ? "rdma" : "tcp",
-        cfg.listen_host,
-        cfg.listen_port,
-        td_region_backing_path(&region),
-        (unsigned long long)td_region_shared_bytes(&region));
+    if (cfg.transport == TD_TRANSPORT_RDMA) {
+        fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=%s:%d rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
+            cfg.node_id,
+            cfg.listen_host,
+            cfg.listen_port,
+            cfg.rdma_device,
+            cfg.rdma_port_num,
+            cfg.rdma_gid_index,
+            td_region_backing_path(&region),
+            (unsigned long long)td_region_shared_bytes(&region));
+    } else {
+        fprintf(stdout, "dist-td mn node_id=%d transport=tcp listen=%s:%d backing=%s bytes=%llu\n",
+            cfg.node_id,
+            cfg.listen_host,
+            cfg.listen_port,
+            td_region_backing_path(&region),
+            (unsigned long long)td_region_shared_bytes(&region));
+    }
     fprintf(stdout, "dist-td mn runtime=%s shared_only_exposure=yes\n", td_tdx_runtime_name(td_region_tdx_runtime(&region)));
     td_print_memory_layout(&cfg, &region);
     fflush(stdout);

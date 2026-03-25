@@ -1,6 +1,6 @@
 CC := cc
 CFLAGS := -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -std=c11 -O2 -Wall -Wextra -Iinclude
-LDLIBS := -lpthread -lcrypto -libverbs -lrdmacm
+LDLIBS := -lpthread -lcrypto -libverbs
 BIN_DIR := bin
 SRC_DIR := src
 BENCH_DIR := benchmark
