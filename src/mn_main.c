@@ -153,6 +153,15 @@ int main(int argc, char **argv) {
                 cfg.rdma_gid_index,
                 td_region_backing_path(&region),
                 (unsigned long long)td_region_shared_bytes(&region));
+        } else if (cfg.rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) {
+            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=vsock port=%d rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
+                cfg.node_id,
+                cfg.listen_port,
+                cfg.rdma_device,
+                cfg.rdma_port_num,
+                cfg.rdma_gid_index,
+                td_region_backing_path(&region),
+                (unsigned long long)td_region_shared_bytes(&region));
         } else {
             fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=tcp %s:%d rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
                 cfg.node_id,

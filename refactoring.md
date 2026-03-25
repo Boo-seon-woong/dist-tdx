@@ -39,7 +39,8 @@ Therefore:
 
 Control/bootstrap plane:
 
-- default: file-based OOB rendezvous
+- preferred in the current `run_td` host/guest deployment: vsock bootstrap
+- optional: file-based OOB rendezvous when CN and MN truly share a filesystem
 - optional fallback: TCP bootstrap
 - used only to exchange RC QP connection attributes
 
@@ -64,9 +65,23 @@ So the design must become:
 2. move QP `INIT -> RTR -> RTS`
 3. perform RDMA and control operations directly over verbs
 
-2.3 OOB file rendezvous
+2.3 OOB variants
 
-The default automated OOB mechanism is a shared directory visible to both CN and MN.
+For the current TDX guest deployment launched by `run_td`, the most practical bootstrap is vsock:
+
+1. `run_td` already provisions `vhost-vsock-pci,guest-cid=3`
+2. MN listens on a configured vsock port
+3. CN connects to `guest_cid:port`
+4. both sides exchange `{LID, QPN, PSN, MTU, optional GID}` and then move the RC QP to `RTR/RTS`
+
+This avoids:
+
+- any dependency on IPoIB
+- any dependency on a shared host/guest filesystem
+
+2.4 OOB file rendezvous
+
+The file-based OOB mechanism is only valid when a shared directory is truly visible to both CN and MN.
 
 Flow:
 
@@ -77,7 +92,13 @@ Flow:
 
 This removes the requirement that CN and MN share a reachable IP bootstrap path.
 
-2.4 Config semantics
+Important:
+
+- creating `/shared/...` only inside the guest is insufficient
+- the current `run_td` script does not automatically mount a shared directory for `/shared`
+- without a real shared mount, file OOB will stall even if both sides have the same pathname
+
+2.5 Config semantics
 
 Under `transport: rdma` and `rdma_bootstrap: file`:
 
@@ -86,6 +107,12 @@ Under `transport: rdma` and `rdma_bootstrap: file`:
 - `mn_node_id` entries are mandatory on the CN
 - `listen_host` / `listen_port` are irrelevant
 - `mn_endpoint` is irrelevant
+
+Under `transport: rdma` and `rdma_bootstrap: vsock`:
+
+- `listen_port` is mandatory on the MN
+- `mn_endpoint` means `guest_cid:port` on the CN
+- with the current `run_td`, the default guest CID is `3`
 
 Under `transport: rdma` and `rdma_bootstrap: tcp`:
 
@@ -96,9 +123,11 @@ Shared RDMA settings:
 
 - `rdma_device` may be either:
   - a verbs device name such as `mlx5_0`
-  - a netdev alias such as `ibp1s0` or `ibs3`
+  - a local netdev such as `ibp1s0` or `ibs3`
 - `rdma_port_num` selects the verbs port on the HCA
 - `rdma_gid_index` is only relevant when the path needs GRH/GID addressing
+
+`rdma_device` is local to each process. CN and guest MN frequently need different values.
 
 3. Memory Architecture
 

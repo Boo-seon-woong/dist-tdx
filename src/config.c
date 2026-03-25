@@ -41,6 +41,10 @@ static int td_parse_rdma_bootstrap(const char *value, td_rdma_bootstrap_t *out) 
         *out = TD_RDMA_BOOTSTRAP_OOB_FILE;
         return 0;
     }
+    if (strcmp(value, "vsock") == 0) {
+        *out = TD_RDMA_BOOTSTRAP_VSOCK;
+        return 0;
+    }
     return -1;
 }
 
@@ -500,10 +504,11 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
         }
     }
     if (cfg->transport == TD_TRANSPORT_RDMA &&
-        cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP &&
+        (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) &&
         cfg->mode == TD_MODE_MN &&
         cfg->listen_port <= 0) {
-        td_format_error(err, err_len, "mn config with tcp bootstrap requires listen_port");
+        td_format_error(err, err_len, "mn config with %s bootstrap requires listen_port",
+            cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK ? "vsock" : "tcp");
         return -1;
     }
     if (cfg->mode == TD_MODE_MN && td_resolve_mn_slots(cfg, err, err_len) != 0) {

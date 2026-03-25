@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <infiniband/verbs.h>
+#include <linux/vm_sockets.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -215,7 +216,7 @@ static int td_rdma_write_binary_file(const char *path, const void *data, size_t 
 
     fp = fopen(temp_path, "wb");
     if (fp == NULL) {
-        td_format_error(err, err_len, "cannot open rdma oob temp file %s", temp_path);
+        td_format_error(err, err_len, "cannot open rdma oob temp file %s; rdma_oob_dir must be a filesystem path shared by both CN and MN", temp_path);
         return -1;
     }
     if (fwrite(data, 1, data_len, fp) != data_len || fflush(fp) != 0) {
@@ -352,6 +353,30 @@ static int td_rdma_pick_first_dirent(const char *path, char *name, size_t name_l
     return -1;
 }
 
+static int td_rdma_parse_vsock_cid(const char *text, unsigned int *cid, char *err, size_t err_len) {
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (text == NULL || text[0] == '\0') {
+        td_format_error(err, err_len, "vsock bootstrap requires a non-empty CID");
+        return -1;
+    }
+    if (strcmp(text, "host") == 0) {
+        *cid = VMADDR_CID_HOST;
+        return 0;
+    }
+
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed > UINT32_MAX) {
+        td_format_error(err, err_len, "invalid vsock CID %s", text);
+        return -1;
+    }
+
+    *cid = (unsigned int)parsed;
+    return 0;
+}
+
 static int td_rdma_resolve_device_name(const char *configured, char *verbs_name, size_t verbs_name_len, int *port_num, char *err, size_t err_len) {
     struct ibv_device **devices = NULL;
     int device_count = 0;
@@ -384,7 +409,9 @@ static int td_rdma_resolve_device_name(const char *configured, char *verbs_name,
         snprintf(path, sizeof(path), "/sys/class/net/%s/device/infiniband", configured);
         if (td_rdma_pick_first_dirent(path, verbs_name, verbs_name_len) != 0) {
             ibv_free_device_list(devices);
-            td_format_error(err, err_len, "cannot map rdma_device %s to an IB verbs device", configured);
+            td_format_error(err, err_len,
+                "cannot map rdma_device %s to an IB verbs device; rdma_device must be the local host/guest device name seen by this process",
+                configured);
             return -1;
         }
 
@@ -781,7 +808,7 @@ static int td_rdma_claim_oob_request(const td_config_t *cfg, td_rdma_oob_record_
 
     dir = opendir(cfg->rdma_oob_dir);
     if (dir == NULL) {
-        td_format_error(err, err_len, "cannot open rdma oob dir %s", cfg->rdma_oob_dir);
+        td_format_error(err, err_len, "cannot open rdma oob dir %s; file bootstrap requires the same shared directory on both CN and MN", cfg->rdma_oob_dir);
         return -1;
     }
 
@@ -1246,6 +1273,34 @@ static int td_rdma_open_control_client(const td_endpoint_t *endpoint, char *err,
     return fd;
 }
 
+static int td_rdma_open_control_client_vsock(const td_endpoint_t *endpoint, char *err, size_t err_len) {
+    struct sockaddr_vm addr;
+    unsigned int cid = 0;
+    int fd;
+
+    if (td_rdma_parse_vsock_cid(endpoint->host, &cid, err, err_len) != 0) {
+        return -1;
+    }
+
+    fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (fd < 0) {
+        td_format_error(err, err_len, "cannot create RDMA vsock bootstrap socket");
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.svm_family = AF_VSOCK;
+    addr.svm_cid = cid;
+    addr.svm_port = (unsigned int)endpoint->port;
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        td_format_error(err, err_len, "cannot connect RDMA vsock bootstrap endpoint cid=%u port=%d", cid, endpoint->port);
+        return -1;
+    }
+    return fd;
+}
+
 static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg, const td_endpoint_t *endpoint, char *err, size_t err_len) {
     td_rdma_impl_t *impl = NULL;
     td_wire_msg_t hello;
@@ -1257,8 +1312,10 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         td_format_error(err, err_len, "out of memory");
         return -1;
     }
-    if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP) {
-        control_fd = td_rdma_open_control_client(endpoint, err, err_len);
+    if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) {
+        control_fd = cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK
+            ? td_rdma_open_control_client_vsock(endpoint, err, err_len)
+            : td_rdma_open_control_client(endpoint, err, err_len);
         if (control_fd < 0) {
             free(impl);
             return -1;
@@ -1266,7 +1323,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     }
     if (td_rdma_setup_impl(impl, cfg, sizeof(td_slot_t), err, err_len) != 0 ||
         td_rdma_post_recv(impl, err, err_len) != 0 ||
-        (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP
+        ((cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK)
             ? td_rdma_exchange_client_bootstrap(control_fd, impl, err, err_len)
             : td_rdma_exchange_client_bootstrap_oob_file(cfg, endpoint, impl, err, err_len)) != 0) {
         if (control_fd >= 0) {
@@ -1441,6 +1498,30 @@ static int td_rdma_open_control_listener(const td_config_t *cfg, char *err, size
     return listen_fd;
 }
 
+static int td_rdma_open_control_listener_vsock(const td_config_t *cfg, char *err, size_t err_len) {
+    struct sockaddr_vm addr;
+    int listen_fd;
+
+    listen_fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        td_format_error(err, err_len, "cannot create RDMA vsock bootstrap listener");
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.svm_family = AF_VSOCK;
+    addr.svm_cid = VMADDR_CID_ANY;
+    addr.svm_port = (unsigned int)cfg->listen_port;
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listen_fd, 16) != 0) {
+        close(listen_fd);
+        td_format_error(err, err_len, "RDMA vsock bootstrap bind/listen failed on port %d", cfg->listen_port);
+        return -1;
+    }
+
+    return listen_fd;
+}
+
 static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t *region, volatile sig_atomic_t *stop_flag, char *err, size_t err_len) {
     while (!(*stop_flag)) {
         td_rdma_oob_record_t request;
@@ -1511,7 +1592,9 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
         return td_rdma_server_run_oob_file(cfg, region, stop_flag, err, err_len);
     }
 
-    listen_fd = td_rdma_open_control_listener(cfg, err, err_len);
+    listen_fd = cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK
+        ? td_rdma_open_control_listener_vsock(cfg, err, err_len)
+        : td_rdma_open_control_listener(cfg, err, err_len);
     if (listen_fd < 0) {
         return -1;
     }

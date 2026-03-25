@@ -16,7 +16,8 @@ The main problem is not "how to make RDMA use IP" but "how to keep RDMA on the I
 RDMA data path no longer depends on IPoIB and does not require `rdma_cm`.
 
 - Data plane: manual verbs RC QP setup plus one-sided RDMA READ/WRITE.
-- Default bootstrap plane: file-based OOB rendezvous through a shared directory visible to both CN and MN.
+- Preferred bootstrap plane for the current `run_td` host/guest deployment: `vsock`.
+- Optional shared-filesystem bootstrap plane: file-based OOB rendezvous through a directory that is truly shared between CN and MN.
 - Optional fallback bootstrap plane: TCP, if a management IP path is intentionally available.
 
 The OOB rendezvous exchanges the minimum RC connection state:
@@ -40,9 +41,21 @@ For `transport: rdma` with `rdma_bootstrap: file`:
 - `rdma_oob_dir`: shared directory used for QP attribute rendezvous
 - `mn_node_id`: CN-side target MN identifier
 - `node_id`: MN-side local node identifier
-- `rdma_device`: either a verbs device name such as `mlx5_0` or a netdev alias such as `ibp1s0` or `ibs3`
+- `rdma_device`: local device name for that process, either a verbs device name such as `mlx5_0` or a local netdev such as `ibp1s0` or `ibs3`
 - `rdma_port_num`: verbs port number to use on that device
 - `rdma_gid_index`: only needed when the fabric path requires a GRH/GID-based address
+
+Important:
+
+- creating `/shared/...` manually inside the guest is not enough
+- `rdma_oob_dir` must be backed by the same shared filesystem on both host CN and guest MN
+- the current `run_td` script does not set up that shared filesystem automatically
+
+For `transport: rdma` with `rdma_bootstrap: vsock`:
+
+- `listen_port`: vsock listener port on the MN side
+- `mn_endpoint`: `guest_cid:port` on the CN side
+- current `run_td` uses `guest-cid=3`, so `mn_endpoint: 3:7301` matches `listen_port: 7301`
 
 For `transport: rdma` with `rdma_bootstrap: tcp`:
 

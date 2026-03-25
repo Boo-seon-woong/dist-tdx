@@ -35,6 +35,7 @@ typedef enum {
 typedef enum {
     TD_RDMA_BOOTSTRAP_TCP = 0,
     TD_RDMA_BOOTSTRAP_OOB_FILE = 1,
+    TD_RDMA_BOOTSTRAP_VSOCK = 2,
 } td_rdma_bootstrap_t;
 
 typedef enum {
