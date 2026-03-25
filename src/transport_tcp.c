@@ -351,8 +351,6 @@ int td_tcp_client_connect(td_session_t *session, const td_endpoint_t *endpoint, 
 
     session->transport = TD_TRANSPORT_TCP;
     session->endpoint = *endpoint;
-    session->remote_addr = response.remote_addr;
-    session->rkey = response.rkey;
     session->header = response.header;
     session->region_size = (size_t)response.header.region_size;
     session->impl = impl;

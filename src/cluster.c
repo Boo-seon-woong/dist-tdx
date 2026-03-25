@@ -995,6 +995,10 @@ static void td_print_latency_profile(FILE *out, const td_latency_profile_t *prof
         td_print_latency_value(out, "rdma_cas_response_elapsed", profile->transport_profile.rdma_cas_response_wait_ns);
         td_print_latency_value(out, "rdma_control_request_send_elapsed", profile->transport_profile.rdma_control_request_send_wait_ns);
         td_print_latency_value(out, "rdma_control_response_elapsed", profile->transport_profile.rdma_control_response_wait_ns);
+        td_print_latency_value(out, "rdma_server_read_total", profile->transport_profile.rdma_server_read_total_ns);
+        td_print_latency_value(out, "rdma_server_read_region", profile->transport_profile.rdma_server_read_region_ns);
+        td_print_latency_value(out, "rdma_server_write_total", profile->transport_profile.rdma_server_write_total_ns);
+        td_print_latency_value(out, "rdma_server_write_region", profile->transport_profile.rdma_server_write_region_ns);
         td_print_latency_value(out, "rdma_server_cas_total", profile->transport_profile.rdma_server_cas_total_ns);
         td_print_latency_value(out, "rdma_server_cas_region", profile->transport_profile.rdma_server_cas_region_ns);
         td_print_latency_value(out, "rdma_server_control_total", profile->transport_profile.rdma_server_control_total_ns);

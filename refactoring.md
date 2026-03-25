@@ -1,6 +1,6 @@
 Objective
 
-Refactor `dist-td` into `dist-tdx` so that an MN running inside an Intel TDX guest can keep one-sided RDMA semantics without violating the TDX memory model.
+Refactor `dist-td` into `dist-tdx` so that an MN running inside an Intel TDX guest can provide stable RDMA-backed access semantics without violating the TDX memory model.
 
 The problem is not "how to do RDMA through TDCALL".
 The problem is "how to expose only the correct memory to RDMA while the MN stays TDX-isolated and while the connection model does not depend on IPoIB".
@@ -28,7 +28,8 @@ Therefore:
 
 1.2 Absolute Rules
 
-- RDMA MUST touch only the shared-exposed region
+- CN MUST never directly access MN private metadata
+- RDMA-visible buffers MUST stay on the shared allocation contract
 - MN private metadata MUST never be RDMA-visible
 - TDCALL MUST NOT appear in the RDMA hot path
 - CN remains responsible for encryption and integrity of shared slot contents
@@ -47,8 +48,8 @@ Control/bootstrap plane:
 RDMA data plane:
 
 - manual verbs RC QP setup
-- one-sided RDMA READ/WRITE for slot data
-- SEND/RECV only for control messages such as `HELLO`, `CAS`, `EVICT`, `CLOSE`
+- RC `SEND/RECV` RPC carrying a wire header and an optional slot-sized payload
+- MN executes read/write/delete/update against the shared slot region on behalf of the CN
 
 2.2 Why this change is required
 
@@ -234,10 +235,8 @@ Anything passed to `ibv_reg_mr()` for the RDMA path must come from the TDX-aware
 
 That includes:
 
-- MN shared slot region MR
 - control SEND/RECV buffers
-- local RDMA READ/WRITE staging buffer
-- CAS helper buffer
+- slot-sized request/response staging buffer
 
 5.2 Connection rule
 
@@ -259,15 +258,17 @@ Do rely on:
 
 5.3 Control-path rule
 
-Control operations remain explicit:
+Operations remain explicit RPCs:
 
 - `HELLO`
+- `READ`
+- `WRITE`
 - `CAS`
 - `EVICT`
 - `CLOSE`
 
-These use SEND/RECV on the already-established RC QP.
-Slot data movement continues to use one-sided RDMA.
+These all use SEND/RECV on the already-established RC QP.
+The shared slot region is no longer exported as a remote one-sided MR.
 
 6. Current Repository State
 
@@ -280,8 +281,8 @@ Implemented:
 - TDX shared allocator switched from private anonymous mappings to shared-anonymous shmem mappings for NIC-visible buffers
 - region header slimmed to remote-visible layout only
 - manual verbs RC setup
-- segmented shared-region MR export so large MN layouts do not depend on a single giant `ibv_reg_mr()`
-- `rdma_region_segment_bytes` tuning knob to lower per-MR registration size in TDX guest deployments
+- RDMA SEND/RECV RPC transport for `READ/WRITE/CAS/EVICT/CLOSE`
+- removal of direct remote exposure of the full shared slot region
 - support for resolving `rdma_device` from either verbs device names or IB netdev aliases
 - `rdma_port_num` config
 - file-based OOB bootstrap using a shared rendezvous directory
@@ -293,6 +294,7 @@ Not a goal of the current code:
 - enabling RDMA by bringing up IPoIB
 - depending on `rdma_cm`
 - performing Linux-safe DMA page conversion entirely from userspace with raw TDCALL
+- assuming a generic guest kernel plus plain anonymous-memory `ibv_reg_mr()` automatically yields a direct user-MR path under TDX
 
 7. Failure Modes to Watch
 
@@ -346,7 +348,7 @@ Root cause:
 
 - RDMA-visible memory or the conversion contract is wrong for the guest DMA path
 
-7.5 Wrong MR granularity assumption
+7.5 Wrong remote-exposure assumption
 
 Symptom:
 
@@ -355,15 +357,33 @@ Symptom:
 
 Root cause:
 
-- the shared slot region was exported as one giant MR
-- the TDX guest deployment may accept small MRs while rejecting one-shot registration of the full MN region
+- the transport still assumes the full shared slot region must be remotely exposed as a one-sided MR
+- the TDX guest deployment may accept small control/payload MRs while rejecting large user-memory MR registration
 
 Fix:
 
-- register the shared slot region as multiple contiguous MRs
-- return the segment table in `HELLO`
-- resolve `{remote_addr, rkey}` per offset on the CN side
-- lower `rdma_region_segment_bytes` when the first large MR still fails inside the guest
+- stop exporting the full shared slot region as a remote MR
+- use SEND/RECV RPC with slot-sized staging buffers
+- keep the 16GB logical shared store, but let the MN CPU execute reads and writes into that store
+
+7.6 Wrong environment assumption
+
+Symptom:
+
+- TDX guest logs show `PCI-DMA: Using software bounce buffering for IO (SWIOTLB)`
+- `mlx5_core ... swiotlb buffer is full`
+- `ibv_reg_mr()` on the MN still fails even after reducing region segment size
+
+Root cause:
+
+- the guest kernel/RDMA stack is still on the bounce-buffer DMA path
+- plain anonymous userspace memory registration is not providing a direct user-MR path under TDX in that environment
+
+Fix:
+
+- change the guest kernel/driver stack, not just the application
+- require a TDX-capable direct user-MR path for `ibv_reg_mr()`, or a supported `dma-buf` MR path on `mlx5`
+- do not treat `set_memory_decrypted()` as a userspace knob; it is a kernel implementation detail behind the supported DMA path
 
 8. Implementation Direction
 
@@ -392,5 +412,6 @@ Phase 4
 - The critical distinction is fabric-level RDMA vs IPoIB
 - The RDMA data plane must work without IPoIB
 - QP setup still needs an OOB exchange path
-- In this refactor, the default OOB path is a shared directory rather than TCP
+- In the current deployment, TCP bootstrap via the `run_td` host is the practical default and file OOB remains optional
+- The current stable TDX-friendly RDMA model is RC SEND/RECV RPC, not one-sided remote exposure of the full slot region
 - The core problem remains memory-model correctness inside TDX

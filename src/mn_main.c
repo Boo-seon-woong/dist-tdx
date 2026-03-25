@@ -145,34 +145,31 @@ int main(int argc, char **argv) {
 
     if (cfg.transport == TD_TRANSPORT_RDMA) {
         if (cfg.rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
-            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=file oob_dir=%s rdma_device=%s rdma_port=%d gid_index=%d segment_bytes=%llu backing=%s bytes=%llu\n",
+            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=file oob_dir=%s rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
                 cfg.node_id,
                 cfg.rdma_oob_dir,
                 cfg.rdma_device,
                 cfg.rdma_port_num,
                 cfg.rdma_gid_index,
-                (unsigned long long)cfg.rdma_region_segment_bytes,
                 td_region_backing_path(&region),
                 (unsigned long long)td_region_shared_bytes(&region));
         } else if (cfg.rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) {
-            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=vsock port=%d rdma_device=%s rdma_port=%d gid_index=%d segment_bytes=%llu backing=%s bytes=%llu\n",
+            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=vsock port=%d rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
                 cfg.node_id,
                 cfg.listen_port,
                 cfg.rdma_device,
                 cfg.rdma_port_num,
                 cfg.rdma_gid_index,
-                (unsigned long long)cfg.rdma_region_segment_bytes,
                 td_region_backing_path(&region),
                 (unsigned long long)td_region_shared_bytes(&region));
         } else {
-            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=tcp %s:%d rdma_device=%s rdma_port=%d gid_index=%d segment_bytes=%llu backing=%s bytes=%llu\n",
+            fprintf(stdout, "dist-td mn node_id=%d transport=rdma bootstrap=tcp %s:%d rdma_device=%s rdma_port=%d gid_index=%d backing=%s bytes=%llu\n",
                 cfg.node_id,
                 cfg.listen_host,
                 cfg.listen_port,
                 cfg.rdma_device,
                 cfg.rdma_port_num,
                 cfg.rdma_gid_index,
-                (unsigned long long)cfg.rdma_region_segment_bytes,
                 td_region_backing_path(&region),
                 (unsigned long long)td_region_shared_bytes(&region));
         }

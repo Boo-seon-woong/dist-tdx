@@ -8,14 +8,14 @@ The main problem is not "how to make RDMA use IP" but "how to keep RDMA on the I
 
 - MN runs inside an Intel TDX guest.
 - CN remains outside the TDX trust boundary.
-- RDMA touches only the shared-exposed slot region and RDMA-visible local buffers.
+- RDMA registers only small shared-visible local buffers; the MN CPU copies between those buffers and the shared slot region.
 - MN metadata, eviction state, and other control-plane state stay private.
 
 ## RDMA connection model
 
 RDMA data path no longer depends on IPoIB and does not require `rdma_cm`.
 
-- Data plane: manual verbs RC QP setup plus one-sided RDMA READ/WRITE.
+- Data plane: manual verbs RC QP setup plus RC `SEND/RECV` RPC carrying a wire header and an optional slot-sized payload.
 - Preferred bootstrap plane for the current `run_td` host/guest deployment: TCP bootstrap over QEMU user-net host forwarding.
 - Optional shared-filesystem bootstrap plane: file-based OOB rendezvous through a directory that is truly shared between CN and MN.
 - Optional bootstrap plane: `vsock`, when the host can reach the guest CID in that QEMU/TDX environment.
@@ -79,8 +79,11 @@ Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers s
 - Safe private/shared handling for DMA registration is left to the guest-kernel DMA/pinning path.
 - `td_tdx_map_shared_memory()` therefore represents the allocator contract for NIC-visible memory, not a promise that userspace completed a raw page conversion by itself.
 - The allocator now uses shared-anonymous shmem mappings instead of private COW anonymous mappings for RDMA-visible buffers.
-- The shared slot region is exported to CN as segmented MRs rather than one giant MR, so large MN regions do not rely on a single `ibv_reg_mr()` succeeding.
-- `rdma_region_segment_bytes` controls the target MR chunk size for the shared slot region and is the main tuning knob when large TDX guest MRs fail with `Input/output error`.
+- The current RDMA transport no longer registers the large shared slot region as a remote MR.
+- RDMA-visible MRs are limited to small control/payload buffers, and the MN CPU executes read/write/delete/update against the shared region on behalf of the CN.
+- `rdma_region_segment_bytes` is retained only for backward config compatibility and is ignored by the current SEND/RECV RPC transport.
+- Current evidence from the TDX guest logs shows `mlx5` still using SWIOTLB bounce buffers for large user-memory registration paths. The refactored RDMA transport avoids that path by removing direct remote exposure of the full shared slot region.
+- If the deployment direction is "fix the environment, not the data model", the guest kernel/RDMA stack must provide a real direct user-MR path under TDX, or expose a supported `dma-buf` MR path such as `ibv_reg_dmabuf_mr()` on `mlx5`.
 
 ## Non-goals
 
