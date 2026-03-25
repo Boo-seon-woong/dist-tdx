@@ -1506,18 +1506,33 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
 static void *td_rdma_server_conn_main(void *arg) {
     td_rdma_server_conn_t *conn = (td_rdma_server_conn_t *)arg;
     char err[256];
+    int poll_count = 0;
+
+    fprintf(stderr, "[MN-DEBUG] server thread started, qpn=%u lid=%u\n",
+            conn->impl.qp->qp_num, conn->impl.lid);
+    fflush(stderr);
 
     while (!(*conn->stop_flag)) {
         struct ibv_wc wc;
         int n = ibv_poll_cq(conn->impl.cq, 1, &wc);
 
         if (n < 0) {
+            fprintf(stderr, "[MN-DEBUG] poll_cq returned error\n");
+            fflush(stderr);
             break;
         }
         if (n == 0) {
+            poll_count++;
+            if (poll_count % 50000000 == 0) {
+                fprintf(stderr, "[MN-DEBUG] still polling CQ, no completions yet (%d polls)\n", poll_count);
+                fflush(stderr);
+            }
             sched_yield();
             continue;
         }
+        fprintf(stderr, "[MN-DEBUG] got CQ completion: opcode=%d status=%d byte_len=%u\n",
+                wc.opcode, wc.status, wc.byte_len);
+        fflush(stderr);
         if (wc.status != IBV_WC_SUCCESS) {
             fprintf(stderr, "rdma server completion failed status=%d (%s)\n", wc.status, ibv_wc_status_str(wc.status));
             fflush(stderr);
@@ -1547,10 +1562,19 @@ static void *td_rdma_server_conn_main(void *arg) {
             op_start = profile_enabled ? td_now_ns() : 0;
 
             if ((size_t)wc.byte_len < sizeof(request)) {
+                fprintf(stderr, "[MN-DEBUG] recv too short: %u < %zu\n", wc.byte_len, sizeof(request));
+                fflush(stderr);
                 response.status = 1;
                 request.op = 0;
             } else {
                 if (request.magic != TD_WIRE_MAGIC) {
+                    fprintf(stderr, "[MN-DEBUG] magic mismatch: got 0x%08x expected 0x%08x, recv_msg@%p first 32 bytes:",
+                            request.magic, TD_WIRE_MAGIC, (void*)conn->impl.recv_msg);
+                    { unsigned char *p = (unsigned char*)conn->impl.recv_msg; int i;
+                      for (i = 0; i < 32; i++) fprintf(stderr, " %02x", p[i]);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
                     break;
                 }
                 payload_len = (size_t)wc.byte_len - sizeof(request);
@@ -1820,6 +1844,10 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                 if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
+                    fprintf(stderr, "[MN-DEBUG] bootstrap OK, local lid=%u qpn=%u psn=%u recv_msg@%p send_msg@%p op_buf@%p\n",
+                            conn->impl.lid, conn->impl.qp->qp_num, conn->impl.psn,
+                            (void*)conn->impl.recv_msg, (void*)conn->impl.send_msg, (void*)conn->impl.op_buf);
+                    fflush(stderr);
                 }
                 close(client_fd);
                 if (conn_err[0] == '\0') {
