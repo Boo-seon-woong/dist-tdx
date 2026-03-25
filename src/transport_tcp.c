@@ -388,11 +388,11 @@ static void *td_tcp_connection_main(void *arg) {
             case TD_WIRE_HELLO:
                 if ((request.flags & TD_WIRE_FLAG_PROFILE) != 0) {
                     uint64_t op_start = td_now_ns();
-                    response.header = *ctx->region->header;
+                    response.header = *td_region_header_view(ctx->region);
                     response.profile_stage1_ns = td_now_ns() - op_start;
                     response.profile_total_ns = response.profile_stage1_ns;
                 } else {
-                    response.header = *ctx->region->header;
+                    response.header = *td_region_header_view(ctx->region);
                 }
                 break;
             case TD_WIRE_READ:

@@ -52,15 +52,16 @@ static void td_print_memory_layout(const td_config_t *cfg, const td_local_region
     char backup_buf[32];
     char used_buf[32];
     char unused_buf[32];
-    size_t private_bytes = sizeof(td_region_header_t) + sizeof(pthread_mutex_t) + (2 * sizeof(size_t));
+    size_t shared_bytes = td_region_shared_bytes(region);
+    size_t private_bytes = td_region_private_bytes(region);
     size_t slot_bytes = sizeof(td_slot_t);
     size_t prime_bytes = cfg->prime_slots * slot_bytes;
     size_t cache_bytes = cfg->cache_slots * slot_bytes;
     size_t backup_bytes = cfg->backup_slots * slot_bytes;
     size_t used_bytes = prime_bytes + cache_bytes + backup_bytes;
-    size_t unused_bytes = region->mapped_bytes > used_bytes ? region->mapped_bytes - used_bytes : 0;
+    size_t unused_bytes = shared_bytes > used_bytes ? shared_bytes - used_bytes : 0;
 
-    td_format_bytes(total_buf, sizeof(total_buf), region->mapped_bytes);
+    td_format_bytes(total_buf, sizeof(total_buf), shared_bytes);
     td_format_bytes(private_buf, sizeof(private_buf), private_bytes);
     td_format_bytes(prime_buf, sizeof(prime_buf), prime_bytes);
     td_format_bytes(cache_buf, sizeof(cache_buf), cache_bytes);
@@ -72,7 +73,7 @@ static void td_print_memory_layout(const td_config_t *cfg, const td_local_region
         "dist-td mn layout mode=%s shared=%s(%llu) private_meta=%s prime=%zu:%s cache=%zu:%s backup=%zu:%s used=%s unused=%s slot_bytes=%zu\n",
         td_slot_layout_mode(cfg),
         total_buf,
-        (unsigned long long)region->mapped_bytes,
+        (unsigned long long)shared_bytes,
         private_buf,
         cfg->prime_slots,
         prime_buf,
@@ -147,9 +148,9 @@ int main(int argc, char **argv) {
         cfg.transport == TD_TRANSPORT_RDMA ? "rdma" : "tcp",
         cfg.listen_host,
         cfg.listen_port,
-        cfg.memory_file,
-        (unsigned long long)region.mapped_bytes);
-    fprintf(stdout, "dist-td mn runtime=%s shared_only_exposure=yes\n", td_tdx_runtime_name(&region.tdx));
+        td_region_backing_path(&region),
+        (unsigned long long)td_region_shared_bytes(&region));
+    fprintf(stdout, "dist-td mn runtime=%s shared_only_exposure=yes\n", td_tdx_runtime_name(td_region_tdx_runtime(&region)));
     td_print_memory_layout(&cfg, &region);
     fflush(stdout);
 

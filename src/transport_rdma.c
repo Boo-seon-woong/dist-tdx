@@ -25,6 +25,7 @@ typedef struct {
     unsigned char *op_buf;
     uint64_t *cas_buf;
     size_t op_buf_len;
+    td_tdx_runtime_t tdx;
 } td_rdma_impl_t;
 
 static uint64_t td_rdma_profile_begin(td_session_t *session) {
@@ -157,10 +158,10 @@ static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
     if (impl->ec != NULL) {
         rdma_destroy_event_channel(impl->ec);
     }
-    free(impl->send_msg);
-    free(impl->recv_msg);
-    free(impl->op_buf);
-    free(impl->cas_buf);
+    td_tdx_unmap_shared_memory(&impl->tdx, impl->send_msg, sizeof(*impl->send_msg));
+    td_tdx_unmap_shared_memory(&impl->tdx, impl->recv_msg, sizeof(*impl->recv_msg));
+    td_tdx_unmap_shared_memory(&impl->tdx, impl->op_buf, impl->op_buf_len);
+    td_tdx_unmap_shared_memory(&impl->tdx, impl->cas_buf, sizeof(*impl->cas_buf));
     memset(impl, 0, sizeof(*impl));
 }
 
@@ -188,13 +189,12 @@ static int td_rdma_setup_qp(td_rdma_impl_t *impl, size_t op_buf_len, char *err, 
         return -1;
     }
 
-    impl->send_msg = (td_wire_msg_t *)calloc(1, sizeof(*impl->send_msg));
-    impl->recv_msg = (td_wire_msg_t *)calloc(1, sizeof(*impl->recv_msg));
-    impl->op_buf = (unsigned char *)calloc(1, op_buf_len);
-    impl->cas_buf = (uint64_t *)calloc(1, sizeof(uint64_t));
     impl->op_buf_len = op_buf_len;
-    if (impl->send_msg == NULL || impl->recv_msg == NULL || impl->op_buf == NULL || impl->cas_buf == NULL) {
-        td_format_error(err, err_len, "rdma buffer allocation failed");
+    /* Keep all NIC-visible local buffers on pages that went through the shared-memory path. */
+    if (td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->send_msg), (void **)&impl->send_msg, err, err_len) != 0 ||
+        td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->recv_msg), (void **)&impl->recv_msg, err, err_len) != 0 ||
+        td_tdx_map_shared_memory(&impl->tdx, impl->op_buf_len, (void **)&impl->op_buf, err, err_len) != 0 ||
+        td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->cas_buf), (void **)&impl->cas_buf, err, err_len) != 0) {
         return -1;
     }
 
@@ -502,7 +502,7 @@ static void td_rdma_client_close(td_session_t *session) {
     session->impl = NULL;
 }
 
-static int td_rdma_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len) {
+static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg, const td_endpoint_t *endpoint, char *err, size_t err_len) {
     struct rdma_addrinfo hints;
     struct rdma_addrinfo *res = NULL;
     td_rdma_impl_t *impl = NULL;
@@ -525,6 +525,11 @@ static int td_rdma_client_connect(td_session_t *session, const td_endpoint_t *en
     if (impl == NULL) {
         rdma_freeaddrinfo(res);
         td_format_error(err, err_len, "out of memory");
+        return -1;
+    }
+    if (td_tdx_runtime_init(&impl->tdx, cfg->mode, cfg->tdx, err, err_len) != 0) {
+        rdma_freeaddrinfo(res);
+        free(impl);
         return -1;
     }
 
@@ -648,8 +653,8 @@ static void *td_rdma_server_conn_main(void *arg) {
 
             if (request.op == TD_WIRE_HELLO) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
-                response.header = *conn->region->header;
-                response.remote_addr = (uint64_t)(uintptr_t)conn->region->base;
+                response.header = *td_region_header_view(conn->region);
+                response.remote_addr = (uint64_t)(uintptr_t)td_region_shared_base(conn->region);
                 response.rkey = conn->region_mr->rkey;
                 if (profile_enabled && stage_start != 0) {
                     response.profile_stage1_ns += td_now_ns() - stage_start;
@@ -764,11 +769,12 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                     int accepted = 0;
                     err[0] = '\0';
                     conn->impl.id = event->id;
+                    conn->impl.tdx = *td_region_tdx_runtime(region);
                     conn->region = region;
                     conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
                     conn->stop_flag = stop_flag;
                     if (td_rdma_setup_qp(&conn->impl, sizeof(td_slot_t), err, err_len) == 0) {
-                        conn->region_mr = ibv_reg_mr(conn->impl.pd, region->base, region->mapped_bytes,
+                        conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
                             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
                         if (conn->region_mr == NULL) {
                             td_format_error(err, err_len, "ibv_reg_mr failed: %s", strerror(errno));
@@ -826,7 +832,7 @@ int td_session_connect(td_session_t *session, const td_config_t *cfg, const td_e
     if (cfg->transport == TD_TRANSPORT_TCP) {
         return td_tcp_client_connect(session, endpoint, err, err_len);
     }
-    return td_rdma_client_connect(session, endpoint, err, err_len);
+    return td_rdma_client_connect(session, cfg, endpoint, err, err_len);
 }
 
 void td_session_close(td_session_t *session) {

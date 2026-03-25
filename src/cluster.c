@@ -60,17 +60,17 @@ static void td_cluster_attach_transport_profile(td_cluster_t *cluster, td_transp
 }
 
 static int td_slot_is_empty(const td_slot_t *slot) {
-    return slot->guard_epoch == 0 &&
-           slot->visible_epoch == 0 &&
-           slot->key_hash == 0 &&
-           slot->flags == 0;
+    return slot->header.guard_epoch == 0 &&
+           slot->header.visible_epoch == 0 &&
+           slot->header.key_hash == 0 &&
+           slot->header.flags == 0;
 }
 
 static int td_slot_present(const td_slot_t *slot, uint64_t key_hash) {
-    return slot->guard_epoch == slot->visible_epoch &&
-           slot->key_hash == key_hash &&
-           (slot->flags & TD_SLOT_FLAG_VALID) != 0 &&
-           (slot->flags & TD_SLOT_FLAG_TOMBSTONE) == 0;
+    return slot->header.guard_epoch == slot->header.visible_epoch &&
+           slot->header.key_hash == key_hash &&
+           (slot->header.flags & TD_SLOT_FLAG_VALID) != 0 &&
+           (slot->header.flags & TD_SLOT_FLAG_TOMBSTONE) == 0;
 }
 
 static int td_fetch_slot_at(td_session_t *session, td_region_kind_t kind, size_t slot_index, td_slot_t *slot, td_probe_profile_t *profile, char *err, size_t err_len) {
@@ -89,18 +89,18 @@ static int td_fetch_slot_at(td_session_t *session, td_region_kind_t kind, size_t
 
 static int td_commit_slot_at(td_session_t *session, td_region_kind_t kind, size_t slot_index, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch, td_commit_timing_t *timing, char *err, size_t err_len) {
     size_t slot_offset = td_region_slot_offset_for_index(&session->header, kind, slot_index);
-    size_t body_offset = slot_offset + offsetof(td_slot_t, visible_epoch);
-    size_t body_len = sizeof(td_slot_t) - offsetof(td_slot_t, visible_epoch);
+    size_t body_offset = slot_offset + td_slot_commit_offset();
+    size_t body_len = td_slot_commit_length();
     uint64_t start_ns = timing != NULL ? td_now_ns() : 0;
 
-    if (session->write_region(session, body_offset, &slot->visible_epoch, body_len, err, err_len) != 0) {
+    if (session->write_region(session, body_offset, td_slot_commit_const_ptr(slot), body_len, err, err_len) != 0) {
         return -1;
     }
     if (timing != NULL && start_ns != 0) {
         timing->write_ns += td_now_ns() - start_ns;
         start_ns = td_now_ns();
     }
-    if (session->cas64(session, slot_offset, compare_epoch, slot->visible_epoch, observed_epoch, err, err_len) != 0) {
+    if (session->cas64(session, slot_offset, compare_epoch, slot->header.visible_epoch, observed_epoch, err, err_len) != 0) {
         return -1;
     }
     if (timing != NULL && start_ns != 0) {
@@ -133,7 +133,7 @@ static int td_probe_slot(td_session_t *session, td_region_kind_t kind, uint64_t 
             ++(*profile->slots_examined);
         }
 
-        if (slot.guard_epoch != slot.visible_epoch) {
+        if (slot.header.guard_epoch != slot.header.visible_epoch) {
             if (profile != NULL && profile->guard_mismatch_count != NULL) {
                 ++(*profile->guard_mismatch_count);
             }
@@ -143,11 +143,11 @@ static int td_probe_slot(td_session_t *session, td_region_kind_t kind, uint64_t 
             continue;
         }
 
-        if ((slot.flags & TD_SLOT_FLAG_VALID) != 0 && slot.key_hash == key_hash) {
+        if ((slot.header.flags & TD_SLOT_FLAG_VALID) != 0 && slot.header.key_hash == key_hash) {
             probe->slot = slot;
             probe->slot_index = slot_index;
             probe->found = 1;
-            probe->tombstone = (slot.flags & TD_SLOT_FLAG_TOMBSTONE) != 0;
+            probe->tombstone = (slot.header.flags & TD_SLOT_FLAG_TOMBSTONE) != 0;
             probe->candidate_slot = slot;
             probe->candidate_slot_index = slot_index;
             probe->candidate_valid = 1;
@@ -157,7 +157,7 @@ static int td_probe_slot(td_session_t *session, td_region_kind_t kind, uint64_t 
             return 0;
         }
 
-        if ((slot.flags & TD_SLOT_FLAG_VALID) != 0 && (slot.flags & TD_SLOT_FLAG_TOMBSTONE) != 0) {
+        if ((slot.header.flags & TD_SLOT_FLAG_VALID) != 0 && (slot.header.flags & TD_SLOT_FLAG_TOMBSTONE) != 0) {
             if (!probe->candidate_valid) {
                 probe->candidate_slot = slot;
                 probe->candidate_slot_index = slot_index;
@@ -220,7 +220,7 @@ static int td_wait_for_primary_change(td_cluster_t *cluster, uint64_t key_hash, 
             ++profile->wait_for_primary_change_attempts;
         }
         if (td_probe_slot(primary, TD_REGION_PRIME, key_hash, &probe, NULL, err, sizeof(err)) == 0 &&
-            (!probe.found || probe.slot.guard_epoch != old_epoch)) {
+            (!probe.found || probe.slot.header.guard_epoch != old_epoch)) {
             td_profile_end(profile, start_ns, profile != NULL ? &profile->wait_for_primary_change_ns : NULL);
             return 0;
         }
@@ -259,7 +259,7 @@ static void td_refresh_cache_best_effort(td_cluster_t *cluster, const char *key,
             sizeof(err)) != 0 || !probe.candidate_valid) {
         return;
     }
-    (void)td_commit_slot_at(primary, TD_REGION_CACHE, probe.candidate_slot_index, slot, probe.candidate_slot.guard_epoch, &observed, profile != NULL ? &timing : NULL, err, sizeof(err));
+    (void)td_commit_slot_at(primary, TD_REGION_CACHE, probe.candidate_slot_index, slot, probe.candidate_slot.header.guard_epoch, &observed, profile != NULL ? &timing : NULL, err, sizeof(err));
     if (profile != NULL) {
         profile->refresh_cache_write_ns += timing.write_ns;
         profile->refresh_cache_cas_ns += timing.cas_ns;
@@ -327,8 +327,8 @@ static int td_cluster_read_value(td_cluster_t *cluster, const char *key, unsigne
             start_ns = td_profile_begin(profile);
             cache_consistent = cache_probe.found &&
                 prime_probe.found &&
-                cache_probe.slot.guard_epoch == prime_probe.slot.guard_epoch &&
-                cache_probe.slot.visible_epoch == prime_probe.slot.visible_epoch &&
+                cache_probe.slot.header.guard_epoch == prime_probe.slot.header.guard_epoch &&
+                cache_probe.slot.header.visible_epoch == prime_probe.slot.header.visible_epoch &&
                 td_slot_present(&cache_probe.slot, key_hash);
             if (profile != NULL) {
                 td_profile_end(profile, start_ns, &profile->cache_validation_ns);
@@ -481,7 +481,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
             err_len) != 0) {
         return -1;
     }
-    current_epoch = primary_probe.candidate_slot.guard_epoch;
+    current_epoch = primary_probe.candidate_slot.header.guard_epoch;
     if (update_only && (!primary_probe.found || primary_probe.tombstone || !td_slot_present(&primary_probe.slot, key_hash))) {
         td_format_error(err, err_len, "update failed: key %s not found", key);
         return -1;
@@ -554,7 +554,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
                 err_len) != 0 || !probe.candidate_valid) {
             return -1;
         }
-        prior_epoch = probe.candidate_slot.guard_epoch;
+        prior_epoch = probe.candidate_slot.header.guard_epoch;
         if (td_commit_slot_at(backup, TD_REGION_BACKUP, probe.candidate_slot_index, &proposal, prior_epoch, &observed, profile != NULL ? &timing : NULL, err, err_len) == 0 &&
             observed == prior_epoch) {
             votes[idx].success = 1;
@@ -563,7 +563,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
             }
         } else {
             votes[idx].observed_epoch = observed;
-            votes[idx].observed_tie = probe.candidate_slot.tie_breaker;
+            votes[idx].observed_tie = probe.candidate_slot.header.tie_breaker;
         }
         if (profile != NULL) {
             profile->backup_write_ns += timing.write_ns;
@@ -572,7 +572,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
     }
 
     start_ns = td_profile_begin(profile);
-    rule = td_evaluate_votes(votes, backup_count, proposal.tie_breaker);
+    rule = td_evaluate_votes(votes, backup_count, proposal.header.tie_breaker);
     if (profile != NULL) {
         td_profile_end(profile, start_ns, &profile->rule_eval_ns);
     }
@@ -624,7 +624,7 @@ static int td_cluster_write_value(td_cluster_t *cluster, const char *key, const 
                     } : NULL,
                     err,
                     err_len) == 0 && probe.candidate_valid) {
-                (void)td_commit_slot_at(backup, TD_REGION_BACKUP, probe.candidate_slot_index, &proposal, probe.candidate_slot.guard_epoch, &observed, profile != NULL ? &timing : NULL, err, sizeof(err));
+                (void)td_commit_slot_at(backup, TD_REGION_BACKUP, probe.candidate_slot_index, &proposal, probe.candidate_slot.header.guard_epoch, &observed, profile != NULL ? &timing : NULL, err, sizeof(err));
                 if (profile != NULL) {
                     profile->repair_write_ns += timing.write_ns;
                     profile->repair_cas_ns += timing.cas_ns;

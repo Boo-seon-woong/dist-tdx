@@ -5,6 +5,10 @@ BIN_DIR := bin
 SRC_DIR := src
 BENCH_DIR := benchmark
 
+ifneq ($(TDX_REAL_TDCALL),)
+CFLAGS += -DTD_TDX_REAL_TDCALL
+endif
+
 COMMON_SRCS := \
 	$(SRC_DIR)/common.c \
 	$(SRC_DIR)/config.c \
