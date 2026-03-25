@@ -23,6 +23,7 @@ enum {
     TD_RDMA_OOB_VERSION = 1,
     TD_RDMA_OOB_REQUEST = 1,
     TD_RDMA_OOB_RESPONSE = 2,
+    TD_RDMA_TARGET_REGION_MR_BYTES = 256 * 1024 * 1024,
 };
 
 typedef struct {
@@ -75,6 +76,7 @@ typedef struct {
     union ibv_gid gid;
     int has_gid;
     uint32_t psn;
+    uint64_t max_mr_size;
 } td_rdma_impl_t;
 
 typedef struct {
@@ -82,7 +84,9 @@ typedef struct {
     td_local_region_t *region;
     size_t eviction_threshold_pct;
     volatile sig_atomic_t *stop_flag;
-    struct ibv_mr *region_mr;
+    struct ibv_mr *region_mrs[TD_RDMA_MAX_REMOTE_SEGMENTS];
+    size_t region_mr_count;
+    size_t region_mr_chunk_bytes;
 } td_rdma_server_conn_t;
 
 typedef struct {
@@ -163,6 +167,20 @@ static uint64_t td_rdma_make_session_id(int target_node_id) {
 
     seq += 1;
     return td_now_ns() ^ ((uint64_t)(uint32_t)getpid() << 16) ^ (uint64_t)(uint32_t)(target_node_id + 1) ^ seq;
+}
+
+static size_t td_rdma_align_up(size_t value, size_t alignment) {
+    if (alignment == 0 || value == 0) {
+        return value;
+    }
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static size_t td_rdma_align_down(size_t value, size_t alignment) {
+    if (alignment == 0 || value == 0) {
+        return value;
+    }
+    return (value / alignment) * alignment;
 }
 
 static int td_rdma_format_oob_path(const char *dir, const char *kind, int target_node_id, uint64_t session_id, char *path, size_t path_len) {
@@ -428,6 +446,7 @@ static int td_rdma_resolve_device_name(const char *configured, char *verbs_name,
 
 static int td_rdma_open_device(td_rdma_impl_t *impl, const td_config_t *cfg, char *err, size_t err_len) {
     struct ibv_device **devices = NULL;
+    struct ibv_device_attr device_attr;
     int device_count = 0;
     char verbs_name[TD_HOST_BYTES];
     int idx;
@@ -456,6 +475,10 @@ static int td_rdma_open_device(td_rdma_impl_t *impl, const td_config_t *cfg, cha
         return -1;
     }
 
+    memset(&device_attr, 0, sizeof(device_attr));
+    if (ibv_query_device(impl->verbs, &device_attr) == 0) {
+        impl->max_mr_size = device_attr.max_mr_size;
+    }
     impl->port_num = port_num > 0 ? port_num : 1;
     impl->gid_index = cfg->rdma_gid_index;
     return 0;
@@ -628,13 +651,163 @@ static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td
             continue;
         }
         if (wc.status != IBV_WC_SUCCESS) {
-            td_format_error(err, err_len, "rdma completion failed status=%d", wc.status);
+            td_format_error(err, err_len, "rdma completion failed status=%d (%s)", wc.status, ibv_wc_status_str(wc.status));
             return -1;
         }
         if (expected == (enum ibv_wc_opcode)-1 || wc.opcode == expected) {
             return 0;
         }
     }
+}
+
+static void td_rdma_dereg_region_mrs(td_rdma_server_conn_t *conn) {
+    size_t idx;
+
+    for (idx = 0; idx < conn->region_mr_count; ++idx) {
+        if (conn->region_mrs[idx] != NULL) {
+            ibv_dereg_mr(conn->region_mrs[idx]);
+            conn->region_mrs[idx] = NULL;
+        }
+    }
+    conn->region_mr_count = 0;
+    conn->region_mr_chunk_bytes = 0;
+}
+
+static size_t td_rdma_pick_region_mr_chunk_bytes(const td_rdma_impl_t *impl, size_t region_bytes, size_t slot_bytes) {
+    size_t chunk_bytes = TD_RDMA_TARGET_REGION_MR_BYTES;
+    size_t min_chunk_bytes;
+
+    if (region_bytes == 0) {
+        return 0;
+    }
+
+    min_chunk_bytes = (region_bytes + TD_RDMA_MAX_REMOTE_SEGMENTS - 1) / TD_RDMA_MAX_REMOTE_SEGMENTS;
+    if (chunk_bytes < min_chunk_bytes) {
+        chunk_bytes = min_chunk_bytes;
+    }
+    if (slot_bytes != 0) {
+        chunk_bytes = td_rdma_align_up(chunk_bytes, slot_bytes);
+    }
+    if (impl->max_mr_size != 0 && (uint64_t)chunk_bytes > impl->max_mr_size) {
+        chunk_bytes = (size_t)impl->max_mr_size;
+        if (slot_bytes != 0) {
+            chunk_bytes = td_rdma_align_down(chunk_bytes, slot_bytes);
+        }
+    }
+    if (chunk_bytes == 0) {
+        return 0;
+    }
+    if (chunk_bytes > region_bytes) {
+        chunk_bytes = region_bytes;
+    }
+    return chunk_bytes;
+}
+
+static int td_rdma_register_region_mrs(td_rdma_server_conn_t *conn, size_t slot_bytes, char *err, size_t err_len) {
+    size_t region_bytes = td_region_shared_bytes(conn->region);
+    unsigned char *region_base = (unsigned char *)td_region_shared_base(conn->region);
+    size_t chunk_bytes;
+    size_t segment_count;
+    size_t idx;
+
+    chunk_bytes = td_rdma_pick_region_mr_chunk_bytes(&conn->impl, region_bytes, slot_bytes);
+    if (chunk_bytes == 0) {
+        td_format_error(err, err_len, "rdma region chunk size resolved to zero");
+        return -1;
+    }
+
+    segment_count = (region_bytes + chunk_bytes - 1) / chunk_bytes;
+    if (segment_count == 0 || segment_count > TD_RDMA_MAX_REMOTE_SEGMENTS) {
+        td_format_error(err, err_len,
+            "rdma region %zu bytes needs %zu MRs with chunk=%zu; reduce mn_memory_size or raise the segment budget",
+            region_bytes,
+            segment_count,
+            chunk_bytes);
+        return -1;
+    }
+
+    conn->region_mr_chunk_bytes = chunk_bytes;
+    for (idx = 0; idx < segment_count; ++idx) {
+        size_t offset = idx * chunk_bytes;
+        size_t length = region_bytes - offset;
+
+        if (length > chunk_bytes) {
+            length = chunk_bytes;
+        }
+        conn->region_mrs[idx] = ibv_reg_mr(conn->impl.pd, region_base + offset, length,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+        if (conn->region_mrs[idx] == NULL) {
+            td_rdma_dereg_region_mrs(conn);
+            td_format_error(err, err_len,
+                "ibv_reg_mr failed for region segment %zu/%zu offset=%zu length=%zu: %s",
+                idx + 1,
+                segment_count,
+                offset,
+                length,
+                strerror(errno));
+            return -1;
+        }
+        conn->region_mr_count = idx + 1;
+    }
+
+    return 0;
+}
+
+static void td_rdma_fill_remote_segments(const td_rdma_server_conn_t *conn, td_wire_msg_t *response) {
+    const unsigned char *region_base = (const unsigned char *)td_region_shared_base(conn->region);
+    size_t region_bytes = td_region_shared_bytes(conn->region);
+    size_t idx;
+
+    response->rdma_segment_count = (uint32_t)conn->region_mr_count;
+    for (idx = 0; idx < conn->region_mr_count; ++idx) {
+        size_t offset = idx * conn->region_mr_chunk_bytes;
+        size_t length = region_bytes - offset;
+
+        if (length > conn->region_mr_chunk_bytes) {
+            length = conn->region_mr_chunk_bytes;
+        }
+        response->rdma_segments[idx].offset = offset;
+        response->rdma_segments[idx].remote_addr = (uint64_t)(uintptr_t)(region_base + offset);
+        response->rdma_segments[idx].length = length;
+        response->rdma_segments[idx].rkey = conn->region_mrs[idx]->rkey;
+    }
+    if (conn->region_mr_count != 0) {
+        response->remote_addr = response->rdma_segments[0].remote_addr;
+        response->rkey = response->rdma_segments[0].rkey;
+    }
+}
+
+static int td_rdma_resolve_remote_access(const td_session_t *session, size_t offset, size_t len, uint64_t *remote_addr, uint32_t *rkey, char *err, size_t err_len) {
+    uint64_t request_end = (uint64_t)offset + (uint64_t)len;
+    uint32_t idx;
+
+    if (request_end < (uint64_t)offset) {
+        td_format_error(err, err_len, "rdma offset overflow");
+        return -1;
+    }
+    if (request_end > session->region_size) {
+        td_format_error(err, err_len, "rdma access out of range offset=%zu len=%zu region=%zu", offset, len, session->region_size);
+        return -1;
+    }
+    if (session->rdma_segment_count == 0) {
+        *remote_addr = session->remote_addr + offset;
+        *rkey = session->rkey;
+        return 0;
+    }
+
+    for (idx = 0; idx < session->rdma_segment_count; ++idx) {
+        uint64_t segment_start = session->rdma_segments[idx].offset;
+        uint64_t segment_end = segment_start + session->rdma_segments[idx].length;
+
+        if ((uint64_t)offset >= segment_start && request_end <= segment_end) {
+            *remote_addr = session->rdma_segments[idx].remote_addr + ((uint64_t)offset - segment_start);
+            *rkey = session->rdma_segments[idx].rkey;
+            return 0;
+        }
+    }
+
+    td_format_error(err, err_len, "rdma remote segment missing for offset=%zu len=%zu", offset, len);
+    return -1;
 }
 
 static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
@@ -986,10 +1159,15 @@ static int td_rdma_client_read(td_session_t *session, size_t offset, void *buf, 
     struct ibv_sge sge;
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad_wr = NULL;
+    uint64_t remote_addr;
+    uint32_t rkey;
     uint64_t start_ns;
 
     if (len > impl->op_buf_len) {
         td_format_error(err, err_len, "rdma read length too large");
+        return -1;
+    }
+    if (td_rdma_resolve_remote_access(session, offset, len, &remote_addr, &rkey, err, err_len) != 0) {
         return -1;
     }
 
@@ -1003,8 +1181,8 @@ static int td_rdma_client_read(td_session_t *session, size_t offset, void *buf, 
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = session->remote_addr + offset;
-    wr.wr.rdma.rkey = session->rkey;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
 
     start_ns = td_rdma_profile_begin(session);
     if (ibv_post_send(impl->qp, &wr, &bad_wr) != 0) {
@@ -1040,10 +1218,15 @@ static int td_rdma_client_write(td_session_t *session, size_t offset, const void
     struct ibv_sge sge;
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad_wr = NULL;
+    uint64_t remote_addr;
+    uint32_t rkey;
     uint64_t start_ns;
 
     if (len > impl->op_buf_len) {
         td_format_error(err, err_len, "rdma write length too large");
+        return -1;
+    }
+    if (td_rdma_resolve_remote_access(session, offset, len, &remote_addr, &rkey, err, err_len) != 0) {
         return -1;
     }
     start_ns = td_rdma_profile_begin(session);
@@ -1060,8 +1243,8 @@ static int td_rdma_client_write(td_session_t *session, size_t offset, const void
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = session->remote_addr + offset;
-    wr.wr.rdma.rkey = session->rkey;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
 
     start_ns = td_rdma_profile_begin(session);
     if (ibv_post_send(impl->qp, &wr, &bad_wr) != 0) {
@@ -1369,6 +1552,14 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     session->endpoint = *endpoint;
     session->remote_addr = response.remote_addr;
     session->rkey = response.rkey;
+    if (response.rdma_segment_count > TD_RDMA_MAX_REMOTE_SEGMENTS) {
+        td_rdma_destroy_impl(impl);
+        free(impl);
+        td_format_error(err, err_len, "rdma hello returned too many remote segments: %u", response.rdma_segment_count);
+        return -1;
+    }
+    session->rdma_segment_count = response.rdma_segment_count;
+    memcpy(session->rdma_segments, response.rdma_segments, sizeof(session->rdma_segments));
     session->header = response.header;
     session->region_size = (size_t)response.header.region_size;
     session->impl = impl;
@@ -1396,6 +1587,8 @@ static void *td_rdma_server_conn_main(void *arg) {
             continue;
         }
         if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "rdma server completion failed status=%d (%s)\n", wc.status, ibv_wc_status_str(wc.status));
+            fflush(stderr);
             break;
         }
         if (wc.opcode == IBV_WC_SEND) {
@@ -1425,8 +1618,7 @@ static void *td_rdma_server_conn_main(void *arg) {
             if (request.op == TD_WIRE_HELLO) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
                 response.header = *td_region_header_view(conn->region);
-                response.remote_addr = (uint64_t)(uintptr_t)td_region_shared_base(conn->region);
-                response.rkey = conn->region_mr->rkey;
+                td_rdma_fill_remote_segments(conn, &response);
                 if (profile_enabled && stage_start != 0) {
                     response.profile_stage1_ns += td_now_ns() - stage_start;
                 }
@@ -1465,9 +1657,7 @@ static void *td_rdma_server_conn_main(void *arg) {
         }
     }
 
-    if (conn->region_mr != NULL) {
-        ibv_dereg_mr(conn->region_mr);
-    }
+    td_rdma_dereg_region_mrs(conn);
     td_rdma_destroy_impl(&conn->impl);
     free(conn);
     return NULL;
@@ -1577,15 +1767,11 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
             conn->stop_flag = stop_flag;
             if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                 td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
-                td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
-                conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
-                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-                if (conn->region_mr == NULL) {
-                    td_format_error(conn_err, sizeof(conn_err), "ibv_reg_mr failed: %s", strerror(errno));
-                }
+                td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, conn_err, sizeof(conn_err)) == 0 &&
+                td_rdma_register_region_mrs(conn, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0) {
             }
             unlink(claimed_request_path);
-            if (conn->region_mr != NULL) {
+            if (conn->region_mr_count != 0) {
                 if (pthread_create(&thread, NULL, td_rdma_server_conn_main, conn) == 0) {
                     pthread_detach(thread);
                     conn = NULL;
@@ -1600,10 +1786,7 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
                     fprintf(stderr, "rdma connection setup failed: %s\n", conn_err);
                     fflush(stderr);
                 }
-                if (conn->region_mr != NULL) {
-                    ibv_dereg_mr(conn->region_mr);
-                    conn->region_mr = NULL;
-                }
+                td_rdma_dereg_region_mrs(conn);
                 unlink(response_path);
                 td_rdma_destroy_impl(&conn->impl);
                 free(conn);
@@ -1667,15 +1850,11 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                 conn->stop_flag = stop_flag;
                 if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
-                    td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
-                    conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
-                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-                    if (conn->region_mr == NULL) {
-                        td_format_error(conn_err, sizeof(conn_err), "ibv_reg_mr failed: %s", strerror(errno));
-                    }
+                    td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0 &&
+                    td_rdma_register_region_mrs(conn, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0) {
                 }
                 close(client_fd);
-                if (conn->region_mr != NULL) {
+                if (conn->region_mr_count != 0) {
                     if (pthread_create(&thread, NULL, td_rdma_server_conn_main, conn) == 0) {
                         pthread_detach(thread);
                         conn = NULL;
@@ -1688,10 +1867,7 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                         fprintf(stderr, "rdma connection setup failed: %s\n", conn_err);
                         fflush(stderr);
                     }
-                    if (conn->region_mr != NULL) {
-                        ibv_dereg_mr(conn->region_mr);
-                        conn->region_mr = NULL;
-                    }
+                    td_rdma_dereg_region_mrs(conn);
                     td_rdma_destroy_impl(&conn->impl);
                     free(conn);
                 }

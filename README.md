@@ -78,6 +78,8 @@ Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers s
 - The code can probe TDX with a real `tdcall` backend when built with `TDX_REAL_TDCALL=1`.
 - Safe private/shared handling for DMA registration is left to the guest-kernel DMA/pinning path.
 - `td_tdx_map_shared_memory()` therefore represents the allocator contract for NIC-visible memory, not a promise that userspace completed a raw page conversion by itself.
+- The allocator now uses shared-anonymous shmem mappings instead of private COW anonymous mappings for RDMA-visible buffers.
+- The shared slot region is exported to CN as segmented MRs rather than one giant MR, so large MN regions do not rely on a single `ibv_reg_mr()` succeeding.
 
 ## Non-goals
 

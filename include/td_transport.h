@@ -17,6 +17,15 @@ typedef enum {
 } td_wire_op_t;
 
 #define TD_WIRE_FLAG_PROFILE 0x1u
+#define TD_RDMA_MAX_REMOTE_SEGMENTS 64
+
+typedef struct {
+    uint64_t offset;
+    uint64_t remote_addr;
+    uint64_t length;
+    uint32_t rkey;
+    uint32_t reserved;
+} td_rdma_remote_segment_t;
 
 typedef struct {
     uint32_t magic;
@@ -30,6 +39,9 @@ typedef struct {
     uint32_t rkey;
     uint32_t flags;
     uint32_t reserved;
+    uint32_t rdma_segment_count;
+    uint32_t reserved2;
+    td_rdma_remote_segment_t rdma_segments[TD_RDMA_MAX_REMOTE_SEGMENTS];
     td_region_header_t header;
     uint64_t profile_total_ns;
     uint64_t profile_stage1_ns;
@@ -124,6 +136,8 @@ typedef struct td_session {
     td_endpoint_t endpoint;
     uint64_t remote_addr;
     uint32_t rkey;
+    uint32_t rdma_segment_count;
+    td_rdma_remote_segment_t rdma_segments[TD_RDMA_MAX_REMOTE_SEGMENTS];
     td_region_header_t header;
     size_t region_size;
     void *impl;

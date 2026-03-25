@@ -277,8 +277,10 @@ Implemented:
 - private sidecar metadata for slot management
 - shared slot header/body separation
 - RDMA-visible local buffers moved onto the shared allocator path
+- TDX shared allocator switched from private anonymous mappings to shared-anonymous shmem mappings for NIC-visible buffers
 - region header slimmed to remote-visible layout only
 - manual verbs RC setup
+- segmented shared-region MR export so large MN layouts do not depend on a single giant `ibv_reg_mr()`
 - support for resolving `rdma_device` from either verbs device names or IB netdev aliases
 - `rdma_port_num` config
 - file-based OOB bootstrap using a shared rendezvous directory
@@ -342,6 +344,24 @@ Symptom:
 Root cause:
 
 - RDMA-visible memory or the conversion contract is wrong for the guest DMA path
+
+7.5 Wrong MR granularity assumption
+
+Symptom:
+
+- small control-buffer `ibv_reg_mr()` succeeds
+- large shared-region `ibv_reg_mr()` fails on the MN with `Input/output error`
+
+Root cause:
+
+- the shared slot region was exported as one giant MR
+- the TDX guest deployment may accept small MRs while rejecting one-shot registration of the full MN region
+
+Fix:
+
+- register the shared slot region as multiple contiguous MRs
+- return the segment table in `HELLO`
+- resolve `{remote_addr, rkey}` per offset on the CN side
 
 8. Implementation Direction
 

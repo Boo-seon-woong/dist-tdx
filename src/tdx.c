@@ -192,11 +192,11 @@ int td_tdx_map_shared_memory(td_tdx_runtime_t *runtime, size_t bytes, void **out
     }
 
     /*
-     * Linux TDX guests perform private/shared transitions in the guest kernel.
-     * Userspace RDMA buffers become DMA-shareable when the kernel pins and DMA
-     * maps them for MR registration, so keep the userspace mapping private here.
+     * Keep NIC-visible allocations on a shmem-backed mapping so the RDMA path
+     * does not start from a private COW anonymous VMA. The guest kernel still
+     * owns the actual TDX private/shared transition for DMA registration.
      */
-    mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (mapped == MAP_FAILED) {
         td_format_error(err, err_len, "shared memory mmap failed");
         return -1;
