@@ -17,7 +17,7 @@ typedef enum {
 } td_wire_op_t;
 
 #define TD_WIRE_FLAG_PROFILE 0x1u
-#define TD_RDMA_MAX_REMOTE_SEGMENTS 64
+#define TD_RDMA_MAX_REMOTE_SEGMENTS 1024
 
 typedef struct {
     uint64_t offset;

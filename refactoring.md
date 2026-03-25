@@ -281,6 +281,7 @@ Implemented:
 - region header slimmed to remote-visible layout only
 - manual verbs RC setup
 - segmented shared-region MR export so large MN layouts do not depend on a single giant `ibv_reg_mr()`
+- `rdma_region_segment_bytes` tuning knob to lower per-MR registration size in TDX guest deployments
 - support for resolving `rdma_device` from either verbs device names or IB netdev aliases
 - `rdma_port_num` config
 - file-based OOB bootstrap using a shared rendezvous directory
@@ -362,6 +363,7 @@ Fix:
 - register the shared slot region as multiple contiguous MRs
 - return the segment table in `HELLO`
 - resolve `{remote_addr, rkey}` per offset on the CN side
+- lower `rdma_region_segment_bytes` when the first large MR still fails inside the guest
 
 8. Implementation Direction
 

@@ -80,6 +80,7 @@ Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers s
 - `td_tdx_map_shared_memory()` therefore represents the allocator contract for NIC-visible memory, not a promise that userspace completed a raw page conversion by itself.
 - The allocator now uses shared-anonymous shmem mappings instead of private COW anonymous mappings for RDMA-visible buffers.
 - The shared slot region is exported to CN as segmented MRs rather than one giant MR, so large MN regions do not rely on a single `ibv_reg_mr()` succeeding.
+- `rdma_region_segment_bytes` controls the target MR chunk size for the shared slot region and is the main tuning knob when large TDX guest MRs fail with `Input/output error`.
 
 ## Non-goals
 

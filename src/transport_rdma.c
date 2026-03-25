@@ -23,7 +23,6 @@ enum {
     TD_RDMA_OOB_VERSION = 1,
     TD_RDMA_OOB_REQUEST = 1,
     TD_RDMA_OOB_RESPONSE = 2,
-    TD_RDMA_TARGET_REGION_MR_BYTES = 256 * 1024 * 1024,
 };
 
 typedef struct {
@@ -87,6 +86,7 @@ typedef struct {
     struct ibv_mr *region_mrs[TD_RDMA_MAX_REMOTE_SEGMENTS];
     size_t region_mr_count;
     size_t region_mr_chunk_bytes;
+    size_t region_mr_target_bytes;
 } td_rdma_server_conn_t;
 
 typedef struct {
@@ -673,12 +673,15 @@ static void td_rdma_dereg_region_mrs(td_rdma_server_conn_t *conn) {
     conn->region_mr_chunk_bytes = 0;
 }
 
-static size_t td_rdma_pick_region_mr_chunk_bytes(const td_rdma_impl_t *impl, size_t region_bytes, size_t slot_bytes) {
-    size_t chunk_bytes = TD_RDMA_TARGET_REGION_MR_BYTES;
+static size_t td_rdma_pick_region_mr_chunk_bytes(const td_rdma_server_conn_t *conn, size_t region_bytes, size_t slot_bytes) {
+    size_t chunk_bytes = conn->region_mr_target_bytes;
     size_t min_chunk_bytes;
 
     if (region_bytes == 0) {
         return 0;
+    }
+    if (chunk_bytes == 0) {
+        chunk_bytes = 16ULL * 1024ULL * 1024ULL;
     }
 
     min_chunk_bytes = (region_bytes + TD_RDMA_MAX_REMOTE_SEGMENTS - 1) / TD_RDMA_MAX_REMOTE_SEGMENTS;
@@ -688,8 +691,8 @@ static size_t td_rdma_pick_region_mr_chunk_bytes(const td_rdma_impl_t *impl, siz
     if (slot_bytes != 0) {
         chunk_bytes = td_rdma_align_up(chunk_bytes, slot_bytes);
     }
-    if (impl->max_mr_size != 0 && (uint64_t)chunk_bytes > impl->max_mr_size) {
-        chunk_bytes = (size_t)impl->max_mr_size;
+    if (conn->impl.max_mr_size != 0 && (uint64_t)chunk_bytes > conn->impl.max_mr_size) {
+        chunk_bytes = (size_t)conn->impl.max_mr_size;
         if (slot_bytes != 0) {
             chunk_bytes = td_rdma_align_down(chunk_bytes, slot_bytes);
         }
@@ -710,7 +713,7 @@ static int td_rdma_register_region_mrs(td_rdma_server_conn_t *conn, size_t slot_
     size_t segment_count;
     size_t idx;
 
-    chunk_bytes = td_rdma_pick_region_mr_chunk_bytes(&conn->impl, region_bytes, slot_bytes);
+    chunk_bytes = td_rdma_pick_region_mr_chunk_bytes(conn, region_bytes, slot_bytes);
     if (chunk_bytes == 0) {
         td_format_error(err, err_len, "rdma region chunk size resolved to zero");
         return -1;
@@ -719,7 +722,7 @@ static int td_rdma_register_region_mrs(td_rdma_server_conn_t *conn, size_t slot_
     segment_count = (region_bytes + chunk_bytes - 1) / chunk_bytes;
     if (segment_count == 0 || segment_count > TD_RDMA_MAX_REMOTE_SEGMENTS) {
         td_format_error(err, err_len,
-            "rdma region %zu bytes needs %zu MRs with chunk=%zu; reduce mn_memory_size or raise the segment budget",
+            "rdma region %zu bytes needs %zu MRs with chunk=%zu; reduce mn_memory_size, reduce rdma_region_segment_bytes, or raise the segment budget",
             region_bytes,
             segment_count,
             chunk_bytes);
@@ -1765,6 +1768,7 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
             conn->region = region;
             conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
             conn->stop_flag = stop_flag;
+            conn->region_mr_target_bytes = cfg->rdma_region_segment_bytes;
             if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                 td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
                 td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, conn_err, sizeof(conn_err)) == 0 &&
@@ -1848,6 +1852,7 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                 conn->region = region;
                 conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
                 conn->stop_flag = stop_flag;
+                conn->region_mr_target_bytes = cfg->rdma_region_segment_bytes;
                 if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0 &&

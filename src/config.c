@@ -272,6 +272,7 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->rdma_bootstrap = TD_RDMA_BOOTSTRAP_OOB_FILE;
     cfg->rdma_gid_index = 0;
     cfg->rdma_port_num = 1;
+    cfg->rdma_region_segment_bytes = 16ULL * 1024ULL * 1024ULL;
     cfg->rdma_oob_poll_ms = 100;
     cfg->rdma_oob_timeout_ms = 30000;
     cfg->listen_port = 0;
@@ -369,6 +370,12 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
             cfg->rdma_gid_index = atoi(value);
         } else if (strcmp(key, "rdma_port_num") == 0) {
             cfg->rdma_port_num = atoi(value);
+        } else if (strcmp(key, "rdma_region_segment_bytes") == 0) {
+            if (td_parse_size_bytes(value, &cfg->rdma_region_segment_bytes) != 0) {
+                td_format_error(err, err_len, "invalid rdma_region_segment_bytes at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
         } else if (strcmp(key, "rdma_oob_dir") == 0) {
             snprintf(cfg->rdma_oob_dir, sizeof(cfg->rdma_oob_dir), "%s", value);
         } else if (strcmp(key, "rdma_oob_poll_ms") == 0) {

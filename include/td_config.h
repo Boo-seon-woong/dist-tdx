@@ -15,6 +15,7 @@ typedef struct td_config {
     td_rdma_bootstrap_t rdma_bootstrap;
     int rdma_gid_index;
     int rdma_port_num;
+    size_t rdma_region_segment_bytes;
     char rdma_oob_dir[TD_PATH_BYTES];
     size_t rdma_oob_poll_ms;
     size_t rdma_oob_timeout_ms;
