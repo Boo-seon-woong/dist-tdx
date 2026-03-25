@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -1352,11 +1353,15 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     hello.op = TD_WIRE_HELLO;
 
     if (td_rdma_send_control(impl, &hello, NULL, NULL, NULL, err, err_len) != 0 ||
-        td_rdma_wait_response(impl, &response, NULL, NULL, NULL, err, err_len) != 0 ||
-        response.status != 0) {
+        td_rdma_wait_response(impl, &response, NULL, NULL, NULL, err, err_len) != 0) {
         td_rdma_destroy_impl(impl);
         free(impl);
-        td_format_error(err, err_len, "rdma hello failed");
+        return -1;
+    }
+    if (response.status != 0) {
+        td_rdma_destroy_impl(impl);
+        free(impl);
+        td_format_error(err, err_len, "rdma hello failed with server status=%u", (unsigned int)response.status);
         return -1;
     }
 
@@ -1559,22 +1564,24 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
         {
             td_rdma_server_conn_t *conn = (td_rdma_server_conn_t *)calloc(1, sizeof(*conn));
             pthread_t thread;
+            char conn_err[256];
 
             if (conn == NULL) {
                 unlink(claimed_request_path);
                 td_format_error(err, err_len, "out of memory");
                 return -1;
             }
+            memset(conn_err, 0, sizeof(conn_err));
             conn->region = region;
             conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
             conn->stop_flag = stop_flag;
-            if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), err, err_len) == 0 &&
-                td_rdma_post_recv(&conn->impl, err, err_len) == 0 &&
-                td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, err, err_len) == 0) {
+            if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
+                td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
+                td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
                 conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
                 if (conn->region_mr == NULL) {
-                    td_format_error(err, err_len, "ibv_reg_mr failed: %s", strerror(errno));
+                    td_format_error(conn_err, sizeof(conn_err), "ibv_reg_mr failed: %s", strerror(errno));
                 }
             }
             unlink(claimed_request_path);
@@ -1583,12 +1590,16 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
                     pthread_detach(thread);
                     conn = NULL;
                 } else {
-                    td_format_error(err, err_len, "pthread_create failed");
+                    td_format_error(conn_err, sizeof(conn_err), "pthread_create failed");
                 }
             } else {
                 unlink(response_path);
             }
             if (conn != NULL) {
+                if (conn_err[0] != '\0') {
+                    fprintf(stderr, "rdma connection setup failed: %s\n", conn_err);
+                    fflush(stderr);
+                }
                 if (conn->region_mr != NULL) {
                     ibv_dereg_mr(conn->region_mr);
                     conn->region_mr = NULL;
@@ -1643,22 +1654,24 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
             if (client_fd >= 0) {
                 td_rdma_server_conn_t *conn = (td_rdma_server_conn_t *)calloc(1, sizeof(*conn));
                 pthread_t thread;
+                char conn_err[256];
 
                 if (conn == NULL) {
                     close(client_fd);
                     continue;
                 }
+                memset(conn_err, 0, sizeof(conn_err));
                 td_rdma_tune_socket(client_fd);
                 conn->region = region;
                 conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
                 conn->stop_flag = stop_flag;
-                if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), err, err_len) == 0 &&
-                    td_rdma_post_recv(&conn->impl, err, err_len) == 0 &&
-                    td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, err, err_len) == 0) {
+                if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
+                    td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
+                    td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
                     conn->region_mr = ibv_reg_mr(conn->impl.pd, td_region_shared_base(region), td_region_shared_bytes(region),
                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
                     if (conn->region_mr == NULL) {
-                        td_format_error(err, err_len, "ibv_reg_mr failed: %s", strerror(errno));
+                        td_format_error(conn_err, sizeof(conn_err), "ibv_reg_mr failed: %s", strerror(errno));
                     }
                 }
                 close(client_fd);
@@ -1667,10 +1680,14 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                         pthread_detach(thread);
                         conn = NULL;
                     } else {
-                        td_format_error(err, err_len, "pthread_create failed");
+                        td_format_error(conn_err, sizeof(conn_err), "pthread_create failed");
                     }
                 }
                 if (conn != NULL) {
+                    if (conn_err[0] != '\0') {
+                        fprintf(stderr, "rdma connection setup failed: %s\n", conn_err);
+                        fflush(stderr);
+                    }
                     if (conn->region_mr != NULL) {
                         ibv_dereg_mr(conn->region_mr);
                         conn->region_mr = NULL;
