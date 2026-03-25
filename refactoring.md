@@ -81,11 +81,19 @@ This avoids:
 
 For example, if MN listens on `7301`, launch the guest with:
 
-- `run_td --tcp-hostfwd-ports 7301`
+- same-host CN case:
+  `run_td --tcp-hostfwd-ports 7301`
+
+- external CN case:
+  `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr 10.20.26.87`
 
 Then the host CN uses:
 
 - `mn_endpoint: 127.0.0.1:7301`
+
+Then an external CN uses:
+
+- `mn_endpoint: 10.20.26.87:7301`
 
 `vsock` bootstrap remains available as an optional path, but it must not be assumed. In some QEMU/TDX combinations the host fails to route to the guest CID even when `vhost-vsock-pci` is configured.
 
