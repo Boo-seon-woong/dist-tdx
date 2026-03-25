@@ -39,9 +39,9 @@ Therefore:
 
 Control/bootstrap plane:
 
-- preferred in the current `run_td` host/guest deployment: vsock bootstrap
+- preferred in the current `run_td` host/guest deployment: TCP bootstrap over QEMU user-net host forwarding
 - optional: file-based OOB rendezvous when CN and MN truly share a filesystem
-- optional fallback: TCP bootstrap
+- optional: vsock bootstrap when host-to-guest CID routing works in that QEMU/TDX environment
 - used only to exchange RC QP connection attributes
 
 RDMA data plane:
@@ -67,17 +67,27 @@ So the design must become:
 
 2.3 OOB variants
 
-For the current TDX guest deployment launched by `run_td`, the most practical bootstrap is vsock:
+For the current TDX guest deployment launched by `run_td`, the most practical automated bootstrap is TCP over QEMU user-net host forwarding:
 
-1. `run_td` already provisions `vhost-vsock-pci,guest-cid=3`
-2. MN listens on a configured vsock port
-3. CN connects to `guest_cid:port`
+1. MN listens on a configured TCP bootstrap port inside the guest
+2. `run_td` forwards that same port from host to guest
+3. CN connects to `127.0.0.1:forwarded_port` on the host
 4. both sides exchange `{LID, QPN, PSN, MTU, optional GID}` and then move the RC QP to `RTR/RTS`
 
 This avoids:
 
 - any dependency on IPoIB
 - any dependency on a shared host/guest filesystem
+
+For example, if MN listens on `7301`, launch the guest with:
+
+- `run_td --tcp-hostfwd-ports 7301`
+
+Then the host CN uses:
+
+- `mn_endpoint: 127.0.0.1:7301`
+
+`vsock` bootstrap remains available as an optional path, but it must not be assumed. In some QEMU/TDX combinations the host fails to route to the guest CID even when `vhost-vsock-pci` is configured.
 
 2.4 OOB file rendezvous
 
@@ -108,16 +118,16 @@ Under `transport: rdma` and `rdma_bootstrap: file`:
 - `listen_host` / `listen_port` are irrelevant
 - `mn_endpoint` is irrelevant
 
-Under `transport: rdma` and `rdma_bootstrap: vsock`:
-
-- `listen_port` is mandatory on the MN
-- `mn_endpoint` means `guest_cid:port` on the CN
-- with the current `run_td`, the default guest CID is `3`
-
 Under `transport: rdma` and `rdma_bootstrap: tcp`:
 
 - `listen_host` / `listen_port` mean bootstrap listener
 - `mn_endpoint` means bootstrap endpoint
+
+Under `transport: rdma` and `rdma_bootstrap: vsock`:
+
+- `listen_port` is mandatory on the MN
+- `mn_endpoint` means `guest_cid:port` on the CN
+- use this only when host-to-guest CID routing is confirmed in the current QEMU/TDX environment
 
 Shared RDMA settings:
 

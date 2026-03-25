@@ -16,9 +16,9 @@ The main problem is not "how to make RDMA use IP" but "how to keep RDMA on the I
 RDMA data path no longer depends on IPoIB and does not require `rdma_cm`.
 
 - Data plane: manual verbs RC QP setup plus one-sided RDMA READ/WRITE.
-- Preferred bootstrap plane for the current `run_td` host/guest deployment: `vsock`.
+- Preferred bootstrap plane for the current `run_td` host/guest deployment: TCP bootstrap over QEMU user-net host forwarding.
 - Optional shared-filesystem bootstrap plane: file-based OOB rendezvous through a directory that is truly shared between CN and MN.
-- Optional fallback bootstrap plane: TCP, if a management IP path is intentionally available.
+- Optional bootstrap plane: `vsock`, when the host can reach the guest CID in that QEMU/TDX environment.
 
 The OOB rendezvous exchanges the minimum RC connection state:
 
@@ -51,16 +51,17 @@ Important:
 - `rdma_oob_dir` must be backed by the same shared filesystem on both host CN and guest MN
 - the current `run_td` script does not set up that shared filesystem automatically
 
-For `transport: rdma` with `rdma_bootstrap: vsock`:
-
-- `listen_port`: vsock listener port on the MN side
-- `mn_endpoint`: `guest_cid:port` on the CN side
-- current `run_td` uses `guest-cid=3`, so `mn_endpoint: 3:7301` matches `listen_port: 7301`
-
 For `transport: rdma` with `rdma_bootstrap: tcp`:
 
 - `listen_host` / `listen_port`: TCP bootstrap listener on the MN side
 - `mn_endpoint`: TCP bootstrap endpoint on the CN side
+- with `run_td --tcp-hostfwd-ports 7301`, the host CN can use `mn_endpoint: 127.0.0.1:7301`
+
+For `transport: rdma` with `rdma_bootstrap: vsock`:
+
+- `listen_port`: vsock listener port on the MN side
+- `mn_endpoint`: `guest_cid:port` on the CN side
+- in some QEMU/TDX combinations the host may still fail to route to the guest CID, so this path is optional rather than assumed
 
 ## TDX memory model
 
