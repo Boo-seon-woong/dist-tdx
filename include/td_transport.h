@@ -17,6 +17,7 @@ typedef enum {
 } td_wire_op_t;
 
 #define TD_WIRE_FLAG_PROFILE 0x1u
+#define TD_WIRE_FLAG_DIRECT_REGION 0x2u
 
 typedef struct {
     uint32_t magic;
