@@ -191,15 +191,15 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
 
     if (cfg->transport == TD_TRANSPORT_RDMA) {
         force_shared_region = cfg->tdx == TD_TDX_ON &&
-            getenv("DISTTDX_FORCE_SHARED_REGION") != NULL &&
-            strcmp(getenv("DISTTDX_FORCE_SHARED_REGION"), "0") != 0;
+            (getenv("DISTTDX_FORCE_SHARED_REGION") == NULL ||
+             strcmp(getenv("DISTTDX_FORCE_SHARED_REGION"), "0") != 0);
         if (cfg->tdx == TD_TDX_ON && !force_shared_region) {
             mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             region->shared.anonymous_mapping = 1;
             region->shared.shared_converted = 0;
             snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-private]");
             fprintf(stderr,
-                "[MN-INFO] leaving slot region private by default; set DISTTDX_FORCE_SHARED_REGION=1 to force full shared conversion\n");
+                "[MN-INFO] leaving slot region private because DISTTDX_FORCE_SHARED_REGION=0 disabled full shared conversion\n");
             fflush(stderr);
         } else {
             mapped = NULL;

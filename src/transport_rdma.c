@@ -1,5 +1,6 @@
 #include "td_transport.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <infiniband/verbs.h>
@@ -23,6 +24,7 @@ enum {
     TD_RDMA_OOB_VERSION = 1,
     TD_RDMA_OOB_REQUEST = 1,
     TD_RDMA_OOB_RESPONSE = 2,
+    TD_RDMA_BOOTSTRAP_FLAG_DIRECT_REGION = 0x1u,
 };
 
 typedef struct {
@@ -41,6 +43,16 @@ typedef struct {
     uint16_t version;
     uint16_t reserved;
     td_rdma_conn_info_t conn;
+    uint64_t ctrl_addr;
+    uint32_t ctrl_rkey;
+    uint32_t flags;
+    uint64_t op_addr;
+    uint32_t op_rkey;
+    uint32_t reserved2;
+    uint64_t region_addr;
+    uint32_t region_rkey;
+    uint32_t reserved3;
+    td_region_header_t header;
 } td_rdma_bootstrap_msg_t;
 
 typedef struct {
@@ -73,6 +85,12 @@ typedef struct {
     union ibv_gid gid;
     int has_gid;
     uint32_t psn;
+    td_rdma_control_mode_t control_mode;
+    int skip_hello;
+    uint64_t remote_ctrl_addr;
+    uint32_t remote_ctrl_rkey;
+    uint64_t remote_op_addr;
+    uint32_t remote_op_rkey;
 } td_rdma_impl_t;
 
 typedef struct {
@@ -349,6 +367,8 @@ static const char *td_rdma_wc_opcode_name(enum ibv_wc_opcode opcode) {
             return "SEND";
         case IBV_WC_RECV:
             return "RECV";
+        case IBV_WC_RECV_RDMA_WITH_IMM:
+            return "RECV_RDMA_WITH_IMM";
         case IBV_WC_RDMA_WRITE:
             return "RDMA_WRITE";
         case IBV_WC_RDMA_READ:
@@ -378,6 +398,25 @@ static void td_rdma_debug_dump_conn_info(const char *prefix, const td_rdma_conn_
         info->gid[4], info->gid[5], info->gid[6], info->gid[7],
         info->gid[8], info->gid[9], info->gid[10], info->gid[11],
         info->gid[12], info->gid[13], info->gid[14], info->gid[15]);
+    fflush(stderr);
+}
+
+static void td_rdma_debug_dump_bootstrap_msg(const char *prefix, const td_rdma_bootstrap_msg_t *msg) {
+    if (msg == NULL) {
+        return;
+    }
+    td_rdma_debug_dump_conn_info(prefix, &msg->conn);
+    fprintf(stderr,
+        "%s ctrl_addr=0x%llx ctrl_rkey=%u op_addr=0x%llx op_rkey=%u region_addr=0x%llx region_rkey=%u flags=0x%x header.region_size=%llu\n",
+        prefix,
+        (unsigned long long)msg->ctrl_addr,
+        msg->ctrl_rkey,
+        (unsigned long long)msg->op_addr,
+        msg->op_rkey,
+        (unsigned long long)msg->region_addr,
+        msg->region_rkey,
+        msg->flags,
+        (unsigned long long)msg->header.region_size);
     fflush(stderr);
 }
 
@@ -803,7 +842,9 @@ static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td
             (unsigned long long)wc.wr_id,
             impl->qp != NULL ? impl->qp->qp_num : 0);
         fflush(stderr);
-        if (expected == (enum ibv_wc_opcode)-1 || wc.opcode == expected) {
+        if (expected == (enum ibv_wc_opcode)-1 ||
+            wc.opcode == expected ||
+            (expected == IBV_WC_RECV && wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
             if (out_wc != NULL) {
                 *out_wc = wc;
             }
@@ -965,6 +1006,8 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size
     }
 
     impl->op_buf_len = op_buf_len;
+    impl->control_mode = cfg->rdma_control_mode;
+    impl->skip_hello = cfg->rdma_skip_hello;
     if (td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->send_msg), (void **)&impl->send_msg, err, err_len) != 0 ||
         td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->recv_msg), (void **)&impl->recv_msg, err, err_len) != 0 ||
         td_tdx_map_shared_memory(&impl->tdx, impl->op_buf_len, (void **)&impl->op_buf, err, err_len) != 0) {
@@ -1148,7 +1191,7 @@ static int td_rdma_exchange_server_bootstrap_oob_file(const td_config_t *cfg, co
     return 0;
 }
 
-static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char *err, size_t err_len) {
+static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, td_rdma_bootstrap_msg_t *remote_out, char *err, size_t err_len) {
     td_rdma_bootstrap_msg_t local_msg;
     td_rdma_bootstrap_msg_t remote_msg;
 
@@ -1158,7 +1201,11 @@ static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_query_local_conn_info(impl, &local_msg.conn, err, err_len) != 0) {
         return -1;
     }
-    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap client local", &local_msg.conn);
+    local_msg.ctrl_addr = (uint64_t)(uintptr_t)impl->recv_msg;
+    local_msg.ctrl_rkey = impl->recv_mr != NULL ? impl->recv_mr->rkey : 0;
+    local_msg.op_addr = (uint64_t)(uintptr_t)impl->op_buf;
+    local_msg.op_rkey = impl->op_mr != NULL ? impl->op_mr->rkey : 0;
+    td_rdma_debug_dump_bootstrap_msg("[RDMA-DEBUG] bootstrap client local", &local_msg);
 
     if (td_send_all(fd, &local_msg, sizeof(local_msg)) != 0 ||
         td_recv_all(fd, &remote_msg, sizeof(remote_msg)) != 0) {
@@ -1168,17 +1215,25 @@ static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_validate_bootstrap(&remote_msg, err, err_len) != 0) {
         return -1;
     }
-    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap client remote", &remote_msg.conn);
+    td_rdma_debug_dump_bootstrap_msg("[RDMA-DEBUG] bootstrap client remote", &remote_msg);
+    impl->remote_ctrl_addr = remote_msg.ctrl_addr;
+    impl->remote_ctrl_rkey = remote_msg.ctrl_rkey;
+    impl->remote_op_addr = remote_msg.op_addr;
+    impl->remote_op_rkey = remote_msg.op_rkey;
     if (td_rdma_qp_to_rtr(impl, &remote_msg.conn, err, err_len) != 0 ||
         td_rdma_qp_to_rts(impl, err, err_len) != 0) {
         return -1;
     }
+    if (remote_out != NULL) {
+        *remote_out = remote_msg;
+    }
     return 0;
 }
 
-static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_impl_t *impl, char *err, size_t err_len) {
+static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_server_conn_t *conn, char *err, size_t err_len) {
     td_rdma_bootstrap_msg_t local_msg;
     td_rdma_bootstrap_msg_t remote_msg;
+    td_rdma_impl_t *impl = &conn->impl;
 
     if (td_recv_all(fd, &remote_msg, sizeof(remote_msg)) != 0) {
         td_format_error(err, err_len, "rdma bootstrap receive failed");
@@ -1194,8 +1249,22 @@ static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_query_local_conn_info(impl, &local_msg.conn, err, err_len) != 0) {
         return -1;
     }
-    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap server remote", &remote_msg.conn);
-    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap server local", &local_msg.conn);
+    local_msg.ctrl_addr = (uint64_t)(uintptr_t)impl->recv_msg;
+    local_msg.ctrl_rkey = impl->recv_mr != NULL ? impl->recv_mr->rkey : 0;
+    local_msg.op_addr = (uint64_t)(uintptr_t)impl->op_buf;
+    local_msg.op_rkey = impl->op_mr != NULL ? impl->op_mr->rkey : 0;
+    local_msg.header = *td_region_header_view(conn->region);
+    if (conn->region_mr != NULL) {
+        local_msg.flags |= TD_RDMA_BOOTSTRAP_FLAG_DIRECT_REGION;
+        local_msg.region_addr = (uint64_t)(uintptr_t)td_region_shared_base(conn->region);
+        local_msg.region_rkey = conn->region_mr->rkey;
+    }
+    td_rdma_debug_dump_bootstrap_msg("[RDMA-DEBUG] bootstrap server remote", &remote_msg);
+    td_rdma_debug_dump_bootstrap_msg("[RDMA-DEBUG] bootstrap server local", &local_msg);
+    impl->remote_ctrl_addr = remote_msg.ctrl_addr;
+    impl->remote_ctrl_rkey = remote_msg.ctrl_rkey;
+    impl->remote_op_addr = remote_msg.op_addr;
+    impl->remote_op_rkey = remote_msg.op_rkey;
     if (td_rdma_qp_to_rtr(impl, &remote_msg.conn, err, err_len) != 0 ||
         td_rdma_qp_to_rts(impl, err, err_len) != 0) {
         return -1;
@@ -1207,7 +1276,7 @@ static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_impl_t *impl, char 
     return 0;
 }
 
-static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
+static int td_rdma_send_message_sendrecv(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
     struct ibv_sge sges[2];
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad_wr = NULL;
@@ -1282,6 +1351,113 @@ static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, 
     return 0;
 }
 
+static int td_rdma_send_message_write_imm(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
+    struct ibv_sge header_sge;
+    struct ibv_sge payload_sge;
+    struct ibv_send_wr header_wr;
+    struct ibv_send_wr payload_wr;
+    struct ibv_send_wr *bad_wr = NULL;
+    struct ibv_send_wr *first_wr = &header_wr;
+    uint64_t start_ns;
+
+    if (impl->remote_ctrl_addr == 0 || impl->remote_ctrl_rkey == 0) {
+        td_format_error(err, err_len, "write_imm control path missing remote control buffer metadata");
+        return -1;
+    }
+    if (payload_len > impl->op_buf_len) {
+        td_format_error(err, err_len, "rdma payload length too large");
+        return -1;
+    }
+
+    memcpy(impl->send_msg, msg, sizeof(*msg));
+    if (payload_len > 0 && payload != NULL) {
+        start_ns = copy_ns != NULL ? td_now_ns() : 0;
+        if (payload != impl->op_buf) {
+            memcpy(impl->op_buf, payload, payload_len);
+        }
+        if (copy_ns != NULL && start_ns != 0) {
+            *copy_ns += td_now_ns() - start_ns;
+        }
+    }
+
+    memset(&header_sge, 0, sizeof(header_sge));
+    header_sge.addr = (uintptr_t)impl->send_msg;
+    header_sge.length = sizeof(*impl->send_msg);
+    header_sge.lkey = impl->send_mr->lkey;
+
+    memset(&header_wr, 0, sizeof(header_wr));
+    header_wr.sg_list = &header_sge;
+    header_wr.num_sge = 1;
+    header_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    header_wr.send_flags = IBV_SEND_SIGNALED;
+    header_wr.imm_data = htonl((uint32_t)msg->op);
+    header_wr.wr.rdma.remote_addr = impl->remote_ctrl_addr;
+    header_wr.wr.rdma.rkey = impl->remote_ctrl_rkey;
+
+    if (payload_len > 0) {
+        if (impl->remote_op_addr == 0 || impl->remote_op_rkey == 0) {
+            td_format_error(err, err_len, "write_imm control path missing remote payload buffer metadata");
+            return -1;
+        }
+        memset(&payload_sge, 0, sizeof(payload_sge));
+        payload_sge.addr = (uintptr_t)impl->op_buf;
+        payload_sge.length = payload_len;
+        payload_sge.lkey = impl->op_mr->lkey;
+
+        memset(&payload_wr, 0, sizeof(payload_wr));
+        payload_wr.sg_list = &payload_sge;
+        payload_wr.num_sge = 1;
+        payload_wr.opcode = IBV_WR_RDMA_WRITE;
+        payload_wr.send_flags = 0;
+        payload_wr.wr.rdma.remote_addr = impl->remote_op_addr;
+        payload_wr.wr.rdma.rkey = impl->remote_op_rkey;
+        payload_wr.next = &header_wr;
+        first_wr = &payload_wr;
+    }
+
+    fprintf(stderr,
+        "[RDMA-DEBUG] post_write_imm op=%s(%u) qpn=%u payload_len=%zu ctrl_remote=0x%llx/%u op_remote=0x%llx/%u\n",
+        td_rdma_wire_op_name(msg->op),
+        (unsigned int)msg->op,
+        impl->qp != NULL ? impl->qp->qp_num : 0,
+        payload_len,
+        (unsigned long long)impl->remote_ctrl_addr,
+        impl->remote_ctrl_rkey,
+        (unsigned long long)impl->remote_op_addr,
+        impl->remote_op_rkey);
+    fflush(stderr);
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] pre-write-imm qp");
+
+    start_ns = post_send_ns != NULL ? td_now_ns() : 0;
+    if (ibv_post_send(impl->qp, first_wr, &bad_wr) != 0) {
+        td_format_error(err, err_len, "rdma write_imm message failed");
+        return -1;
+    }
+    if (post_send_ns != NULL && start_ns != 0) {
+        *post_send_ns += td_now_ns() - start_ns;
+    }
+
+    start_ns = send_wait_ns != NULL ? td_now_ns() : 0;
+    if (td_rdma_poll_wc(impl, IBV_WC_RDMA_WRITE, wait_profile, NULL, err, err_len) != 0) {
+        return -1;
+    }
+    fprintf(stderr, "[RDMA-DEBUG] write_imm completion op=%s qpn=%u\n",
+        td_rdma_wire_op_name(msg->op),
+        impl->qp != NULL ? impl->qp->qp_num : 0);
+    fflush(stderr);
+    if (send_wait_ns != NULL && start_ns != 0) {
+        *send_wait_ns += td_now_ns() - start_ns;
+    }
+    return 0;
+}
+
+static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
+    if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
+        return td_rdma_send_message_write_imm(impl, msg, payload, payload_len, copy_ns, post_send_ns, send_wait_ns, wait_profile, err, err_len);
+    }
+    return td_rdma_send_message_sendrecv(impl, msg, payload, payload_len, copy_ns, post_send_ns, send_wait_ns, wait_profile, err, err_len);
+}
+
 static int td_rdma_wait_message(td_rdma_impl_t *impl, td_wire_msg_t *response, void *payload, size_t payload_cap, size_t *payload_len_out, uint64_t *wait_ns, td_rdma_wait_profile_t *wait_profile, uint64_t *header_copy_ns, uint64_t *payload_copy_ns, char *err, size_t err_len) {
     struct ibv_wc wc;
     uint64_t start_ns = wait_ns != NULL ? td_now_ns() : 0;
@@ -1293,19 +1469,23 @@ static int td_rdma_wait_message(td_rdma_impl_t *impl, td_wire_msg_t *response, v
     if (wait_ns != NULL && start_ns != 0) {
         *wait_ns += td_now_ns() - start_ns;
     }
-    if ((size_t)wc.byte_len < sizeof(*impl->recv_msg)) {
-        td_format_error(err, err_len, "rdma recv message too short: %u", wc.byte_len);
-        return -1;
-    }
-    payload_len = (size_t)wc.byte_len - sizeof(*impl->recv_msg);
     start_ns = header_copy_ns != NULL ? td_now_ns() : 0;
     memcpy(response, impl->recv_msg, sizeof(*response));
     if (header_copy_ns != NULL && start_ns != 0) {
         *header_copy_ns += td_now_ns() - start_ns;
     }
-    if (response->length != payload_len) {
-        td_format_error(err, err_len, "rdma recv payload length mismatch: header=%zu actual=%zu", (size_t)response->length, payload_len);
-        return -1;
+    if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+        payload_len = (size_t)response->length;
+    } else {
+        if ((size_t)wc.byte_len < sizeof(*impl->recv_msg)) {
+            td_format_error(err, err_len, "rdma recv message too short: %u", wc.byte_len);
+            return -1;
+        }
+        payload_len = (size_t)wc.byte_len - sizeof(*impl->recv_msg);
+        if (response->length != payload_len) {
+            td_format_error(err, err_len, "rdma recv payload length mismatch: header=%zu actual=%zu", (size_t)response->length, payload_len);
+            return -1;
+        }
     }
     if (payload_len > payload_cap && payload != NULL) {
         td_format_error(err, err_len, "rdma recv payload too large: %zu > %zu", payload_len, payload_cap);
@@ -1812,6 +1992,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     td_rdma_impl_t *impl = NULL;
     td_wire_msg_t hello;
     td_wire_msg_t response;
+    td_rdma_bootstrap_msg_t bootstrap_remote;
     int control_fd = -1;
 
     impl = (td_rdma_impl_t *)calloc(1, sizeof(*impl));
@@ -1842,8 +2023,9 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     }
     fprintf(stderr, "[DEBUG] QP setup done, exchanging bootstrap...\n");
     fflush(stderr);
+    memset(&bootstrap_remote, 0, sizeof(bootstrap_remote));
     if (((cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK)
-            ? td_rdma_exchange_client_bootstrap(control_fd, impl, err, err_len)
+            ? td_rdma_exchange_client_bootstrap(control_fd, impl, &bootstrap_remote, err, err_len)
             : td_rdma_exchange_client_bootstrap_oob_file(cfg, endpoint, impl, err, err_len)) != 0) {
         if (control_fd >= 0) {
             close(control_fd);
@@ -1861,32 +2043,42 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     fflush(stderr);
     td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] client post-bootstrap qp");
 
-    memset(&hello, 0, sizeof(hello));
-    hello.magic = TD_WIRE_MAGIC;
-    hello.op = TD_WIRE_HELLO;
-
-    fprintf(stderr, "[DEBUG] sending HELLO via RDMA...\n");
-    fflush(stderr);
-    if (td_rdma_post_recv(impl, err, err_len) != 0 ||
-        td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0) {
-        fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+    if (cfg->rdma_skip_hello) {
+        fprintf(stderr, "[DEBUG] skipping HELLO; using bootstrap metadata directly\n");
         fflush(stderr);
-        td_rdma_destroy_impl(impl);
-        free(impl);
-        return -1;
-    }
-    fprintf(stderr, "[DEBUG] HELLO send completed, waiting for response...\n");
-    fflush(stderr);
-    if (td_rdma_wait_message(impl, &response, NULL, 0, NULL, NULL, NULL, NULL, NULL, err, err_len) != 0) {
-        td_rdma_destroy_impl(impl);
-        free(impl);
-        return -1;
-    }
-    if (response.status != 0) {
-        td_rdma_destroy_impl(impl);
-        free(impl);
-        td_format_error(err, err_len, "rdma hello failed with server status=%u", (unsigned int)response.status);
-        return -1;
+        memset(&response, 0, sizeof(response));
+        response.flags = (bootstrap_remote.flags & TD_RDMA_BOOTSTRAP_FLAG_DIRECT_REGION) != 0 ? TD_WIRE_FLAG_DIRECT_REGION : 0;
+        response.remote_addr = bootstrap_remote.region_addr;
+        response.rkey = bootstrap_remote.region_rkey;
+        response.header = bootstrap_remote.header;
+    } else {
+        memset(&hello, 0, sizeof(hello));
+        hello.magic = TD_WIRE_MAGIC;
+        hello.op = TD_WIRE_HELLO;
+
+        fprintf(stderr, "[DEBUG] sending HELLO via RDMA...\n");
+        fflush(stderr);
+        if (td_rdma_post_recv(impl, err, err_len) != 0 ||
+            td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0) {
+            fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+            fflush(stderr);
+            td_rdma_destroy_impl(impl);
+            free(impl);
+            return -1;
+        }
+        fprintf(stderr, "[DEBUG] HELLO send completed, waiting for response...\n");
+        fflush(stderr);
+        if (td_rdma_wait_message(impl, &response, NULL, 0, NULL, NULL, NULL, NULL, NULL, err, err_len) != 0) {
+            td_rdma_destroy_impl(impl);
+            free(impl);
+            return -1;
+        }
+        if (response.status != 0) {
+            td_rdma_destroy_impl(impl);
+            free(impl);
+            td_format_error(err, err_len, "rdma hello failed with server status=%u", (unsigned int)response.status);
+            return -1;
+        }
     }
 
     session->transport = TD_TRANSPORT_RDMA;
@@ -1950,7 +2142,7 @@ static void *td_rdma_server_conn_main(void *arg) {
         if (wc.opcode == IBV_WC_SEND) {
             continue;
         }
-        if (wc.opcode != IBV_WC_RECV) {
+        if (wc.opcode != IBV_WC_RECV && wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
             continue;
         }
 
@@ -1970,23 +2162,31 @@ static void *td_rdma_server_conn_main(void *arg) {
             profile_enabled = (request.flags & TD_WIRE_FLAG_PROFILE) != 0;
             op_start = profile_enabled ? td_now_ns() : 0;
 
-            if ((size_t)wc.byte_len < sizeof(request)) {
-                fprintf(stderr, "[MN-DEBUG] recv too short: %u < %zu\n", wc.byte_len, sizeof(request));
+            if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                payload_len = (size_t)request.length;
+                fprintf(stderr, "[MN-DEBUG] recv RDMA_WRITE_WITH_IMM imm=0x%08x request_len=%zu\n",
+                    ntohl(wc.imm_data),
+                    payload_len);
                 fflush(stderr);
-                response.status = 1;
-                request.op = 0;
             } else {
-                if (request.magic != TD_WIRE_MAGIC) {
-                    fprintf(stderr, "[MN-DEBUG] magic mismatch: got 0x%08x expected 0x%08x, recv_msg@%p first 32 bytes:",
-                            request.magic, TD_WIRE_MAGIC, (void*)conn->impl.recv_msg);
-                    { unsigned char *p = (unsigned char*)conn->impl.recv_msg; int i;
-                      for (i = 0; i < 32; i++) fprintf(stderr, " %02x", p[i]);
-                    }
-                    fprintf(stderr, "\n");
+                if ((size_t)wc.byte_len < sizeof(request)) {
+                    fprintf(stderr, "[MN-DEBUG] recv too short: %u < %zu\n", wc.byte_len, sizeof(request));
                     fflush(stderr);
-                    break;
+                    response.status = 1;
+                    request.op = 0;
+                } else {
+                    payload_len = (size_t)wc.byte_len - sizeof(request);
                 }
-                payload_len = (size_t)wc.byte_len - sizeof(request);
+            }
+            if (request.op != 0 && request.magic != TD_WIRE_MAGIC) {
+                fprintf(stderr, "[MN-DEBUG] magic mismatch: got 0x%08x expected 0x%08x, recv_msg@%p first 32 bytes:",
+                        request.magic, TD_WIRE_MAGIC, (void*)conn->impl.recv_msg);
+                { unsigned char *p = (unsigned char*)conn->impl.recv_msg; int i;
+                  for (i = 0; i < 32; i++) fprintf(stderr, " %02x", p[i]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                break;
             }
 
             if (request.op == TD_WIRE_HELLO) {
@@ -2265,7 +2465,7 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                 if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_register_server_region(conn, conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
-                    td_rdma_exchange_server_bootstrap(client_fd, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
+                    td_rdma_exchange_server_bootstrap(client_fd, conn, conn_err, sizeof(conn_err)) == 0) {
                     fprintf(stderr, "[MN-DEBUG] bootstrap OK, local lid=%u qpn=%u psn=%u recv_msg@%p send_msg@%p op_buf@%p\n",
                             conn->impl.lid, conn->impl.qp->qp_num, conn->impl.psn,
                             (void*)conn->impl.recv_msg, (void*)conn->impl.send_msg, (void*)conn->impl.op_buf);

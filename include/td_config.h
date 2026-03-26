@@ -3,6 +3,11 @@
 
 #include "td_common.h"
 
+typedef enum {
+    TD_RDMA_CONTROL_SEND = 0,
+    TD_RDMA_CONTROL_WRITE_IMM = 1,
+} td_rdma_control_mode_t;
+
 typedef struct td_config {
     td_mode_t mode;
     td_transport_t transport;
@@ -13,6 +18,8 @@ typedef struct td_config {
     char encryption_key_hex[(TD_KEY_MATERIAL_BYTES * 2) + 1];
     char rdma_device[TD_HOST_BYTES];
     td_rdma_bootstrap_t rdma_bootstrap;
+    td_rdma_control_mode_t rdma_control_mode;
+    int rdma_skip_hello;
     int rdma_gid_index;
     int rdma_port_num;
     size_t rdma_region_segment_bytes;

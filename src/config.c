@@ -48,6 +48,18 @@ static int td_parse_rdma_bootstrap(const char *value, td_rdma_bootstrap_t *out) 
     return -1;
 }
 
+static int td_parse_rdma_control_mode(const char *value, td_rdma_control_mode_t *out) {
+    if (strcmp(value, "send") == 0) {
+        *out = TD_RDMA_CONTROL_SEND;
+        return 0;
+    }
+    if (strcmp(value, "write_imm") == 0 || strcmp(value, "rdma_write_with_imm") == 0) {
+        *out = TD_RDMA_CONTROL_WRITE_IMM;
+        return 0;
+    }
+    return -1;
+}
+
 static int td_parse_toggle(const char *value, int *out) {
     if (strcmp(value, "on") == 0) {
         *out = 1;
@@ -270,6 +282,8 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->cache = TD_CACHE_ON;
     cfg->mn_memory_size = 64ULL * 1024ULL * 1024ULL;
     cfg->rdma_bootstrap = TD_RDMA_BOOTSTRAP_OOB_FILE;
+    cfg->rdma_control_mode = TD_RDMA_CONTROL_WRITE_IMM;
+    cfg->rdma_skip_hello = 0;
     cfg->rdma_gid_index = 0;
     cfg->rdma_port_num = 1;
     cfg->rdma_region_segment_bytes = 16ULL * 1024ULL * 1024ULL;
@@ -366,6 +380,20 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
                 fclose(fp);
                 return -1;
             }
+        } else if (strcmp(key, "rdma_control_mode") == 0) {
+            if (td_parse_rdma_control_mode(value, &cfg->rdma_control_mode) != 0) {
+                td_format_error(err, err_len, "invalid rdma_control_mode at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(key, "rdma_skip_hello") == 0) {
+            int toggle = 0;
+            if (td_parse_toggle(value, &toggle) != 0) {
+                td_format_error(err, err_len, "invalid rdma_skip_hello at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
+            cfg->rdma_skip_hello = toggle;
         } else if (strcmp(key, "rdma_gid_index") == 0) {
             cfg->rdma_gid_index = atoi(value);
         } else if (strcmp(key, "rdma_port_num") == 0) {
@@ -480,6 +508,12 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
     }
     if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_port_num <= 0) {
         td_format_error(err, err_len, "rdma_port_num must be greater than zero");
+        return -1;
+    }
+    if (cfg->transport == TD_TRANSPORT_RDMA &&
+        (cfg->rdma_control_mode == TD_RDMA_CONTROL_WRITE_IMM || cfg->rdma_skip_hello) &&
+        cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
+        td_format_error(err, err_len, "rdma write_imm/skip_hello options currently require tcp or vsock bootstrap");
         return -1;
     }
     if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
