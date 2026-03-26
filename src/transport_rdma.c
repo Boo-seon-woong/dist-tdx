@@ -658,6 +658,16 @@ static int td_rdma_register_shared_buffer_mr(td_rdma_impl_t *impl, void *base, s
 }
 
 static int td_rdma_register_server_region(td_rdma_server_conn_t *conn, char *err, size_t err_len) {
+    if (conn->impl.tdx.enabled == TD_TDX_ON) {
+        fprintf(stderr,
+            "[MN-INFO] TDX guest keeps the slot region private; using SEND/RECV path for READ/WRITE to avoid SWIOTLB exhaustion\n");
+        fflush(stderr);
+        if (err != NULL && err_len > 0) {
+            err[0] = '\0';
+        }
+        return 0;
+    }
+
     fprintf(stderr, "[MN-DEBUG] registering shared region MR base=%p bytes=%zu\n",
         td_region_shared_base(conn->region),
         td_region_shared_bytes(conn->region));
