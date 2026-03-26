@@ -44,14 +44,14 @@ sudo /home/seonung/2026/tdx/guest-tools/run_td \
 The current `.conf` files intentionally use:
 
 - `rdma_bootstrap: tcp`
-- `rdma_control_mode: write_imm`
+- `rdma_control_mode: send`
 - `rdma_data_mode: rpc`
 - `rdma_skip_hello: on`
 
 Meaning:
 
 - bootstrap is TCP
-- control messages use `RDMA_WRITE_WITH_IMM`
+- control messages use `SEND/RECV`
 - `READ/WRITE` use RPC fallback instead of one-sided direct region access
 - CN does not send a separate `HELLO`
 
@@ -113,16 +113,14 @@ Recent CN log confirms that the client is not taking the one-sided direct read/w
 
 This is important because it rules out "CN is still accidentally trying direct RDMA read/write" as the main explanation.
 
-### 5. `write_imm` access rights were fixed
+### 5. `write_imm` is no longer a viable control path
 
-The control path originally used `RDMA_WRITE_WITH_IMM`, but the responder-side QP and MRs did not allow remote writes.
+Minimal repro now shows that `RDMA_WRITE_WITH_IMM` still hangs even after QP setup and MR registration succeed, while the runtime is being moved to `SEND/RECV` for control traffic.
 
-That was fixed by:
+Implication:
 
-- enabling `IBV_ACCESS_REMOTE_WRITE` on the guest/shared control buffers
-- enabling `IBV_ACCESS_REMOTE_WRITE` in QP INIT when `write_imm` mode is active
-
-This fixed the immediate QP-to-ERR transition on first RPC.
+- do not depend on `RDMA_WRITE_WITH_IMM` for control RPCs in the TDX guest path
+- prefer `send + rpc` as the transport baseline while debugging the remaining guest RDMA target-path issues
 
 ## Current Failure
 
@@ -131,9 +129,8 @@ Current CN behavior:
 ```text
 td> read a
 [RDMA-DEBUG] post_recv qpn=96 ...
-[RDMA-DEBUG] post_write_imm op=READ(2) qpn=96 payload_len=0 ctrl_remote=... op_remote=...
-[RDMA-DEBUG] pre-write-imm qp state=RTS ...
-[RDMA-DEBUG] waiting for CQ completion expected=RDMA_WRITE empty_polls=50000000 qpn=96
+[RDMA-DEBUG] post_send op=READ(2) qpn=96 ...
+[RDMA-DEBUG] waiting for CQ completion expected=SEND empty_polls=...
 ...
 ```
 
@@ -152,9 +149,9 @@ What that means:
 - both QPs are already in `RTS`
 - bootstrap metadata is already exchanged
 
-So the current failure point is:
+So the remaining failure point is:
 
-- the first inbound RDMA packet to guest shared memory never completes
+- the guest RDMA target path is still not reliable enough for end-to-end CRUD even after removing `write_imm`
 
 ## Current Interpretation
 
@@ -207,7 +204,7 @@ The next meaningful test is not another protocol change inside `dist-tdx`.
 
 Instead, validate the environment directly with a minimal verbs test that does only this:
 
-- CN issues `RDMA_WRITE_WITH_IMM` or `SEND`
+- CN issues `SEND`
 - target buffer lives in the TDX guest and is shared-converted the same way `dist-tdx` uses it
 
 If that minimal test also hangs, the blocker is definitively outside `dist-tdx`.

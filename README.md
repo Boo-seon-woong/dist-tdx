@@ -79,7 +79,6 @@ There are two independent choices in the RDMA path.
 Control path:
 
 - `send`
-- `write_imm`
 
 Data path:
 
@@ -88,13 +87,13 @@ Data path:
 
 Current recommended config for the real TDX deployment uses:
 
-- `rdma_control_mode: write_imm`
+- `rdma_control_mode: send`
 - `rdma_data_mode: rpc`
 - `rdma_skip_hello: on`
 
 Meaning:
 
-- control operations use `RDMA_WRITE_WITH_IMM`
+- control operations use `SEND/RECV`
 - `READ/WRITE` are issued as RPCs instead of one-sided direct region access
 - CN skips `HELLO` and uses bootstrap metadata directly
 
@@ -126,7 +125,7 @@ RDMA:
 - `rdma_device`
 - `rdma_port_num`
 - `rdma_gid_index`
-- `rdma_control_mode: send|write_imm`
+- `rdma_control_mode: send`
 - `rdma_data_mode: direct|rpc`
 - `rdma_skip_hello: on|off`
 
@@ -208,7 +207,7 @@ Symptoms:
 This affects both:
 
 - earlier `SEND/RECV`-based control flow
-- current `write_imm + rpc` control/data flow
+- earlier `write_imm + rpc` control/data flow
 
 So the active blocker appears to be the guest RDMA target path itself, not the higher-level `dist-tdx` protocol design.
 
@@ -223,7 +222,7 @@ During connection, these lines are the highest-signal ones:
 - `qp->RTS ...`
 - `using direct RDMA region path ...`
 - `using RDMA RPC fallback for READ/WRITE ...`
-- `post_write_imm ...`
+- `post_send ...`
 - `waiting for CQ completion ...`
 
 If `data=rpc` is configured and the log still shows direct-path behavior, the binary is stale.

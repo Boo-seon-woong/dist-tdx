@@ -346,7 +346,7 @@ static const char *td_rdma_control_mode_name(td_rdma_control_mode_t mode) {
         case TD_RDMA_CONTROL_SEND:
             return "send";
         case TD_RDMA_CONTROL_WRITE_IMM:
-            return "write_imm";
+            return "send";
         default:
             return "unknown";
     }
@@ -689,9 +689,6 @@ static int td_rdma_qp_to_init(td_rdma_impl_t *impl, char *err, size_t err_len) {
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = (uint8_t)impl->port_num;
     attr.pkey_index = 0;
-    if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
-        access_flags |= IBV_ACCESS_REMOTE_WRITE;
-    }
     if (impl->data_mode == TD_RDMA_DATA_DIRECT) {
         access_flags |= IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
     }
@@ -1036,7 +1033,7 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size
     }
 
     impl->op_buf_len = op_buf_len;
-    impl->control_mode = cfg->rdma_control_mode;
+    impl->control_mode = TD_RDMA_CONTROL_SEND;
     impl->data_mode = cfg->rdma_data_mode;
     impl->skip_hello = cfg->rdma_skip_hello;
     fprintf(stderr,
@@ -1055,11 +1052,6 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size
     {
         int control_recv_access = IBV_ACCESS_LOCAL_WRITE;
         int op_buf_access = IBV_ACCESS_LOCAL_WRITE;
-
-        if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
-            control_recv_access |= IBV_ACCESS_REMOTE_WRITE;
-            op_buf_access |= IBV_ACCESS_REMOTE_WRITE;
-        }
 
         if (td_rdma_register_shared_buffer_mr(impl, impl->send_msg, sizeof(*impl->send_msg), IBV_ACCESS_LOCAL_WRITE, &impl->send_mr, err, err_len) != 0 ||
             td_rdma_register_shared_buffer_mr(impl, impl->recv_msg, sizeof(*impl->recv_msg), control_recv_access, &impl->recv_mr, err, err_len) != 0 ||
@@ -1399,110 +1391,7 @@ static int td_rdma_send_message_sendrecv(td_rdma_impl_t *impl, const td_wire_msg
     return 0;
 }
 
-static int td_rdma_send_message_write_imm(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
-    struct ibv_sge header_sge;
-    struct ibv_sge payload_sge;
-    struct ibv_send_wr header_wr;
-    struct ibv_send_wr payload_wr;
-    struct ibv_send_wr *bad_wr = NULL;
-    struct ibv_send_wr *first_wr = &header_wr;
-    uint64_t start_ns;
-
-    if (impl->remote_ctrl_addr == 0 || impl->remote_ctrl_rkey == 0) {
-        td_format_error(err, err_len, "write_imm control path missing remote control buffer metadata");
-        return -1;
-    }
-    if (payload_len > impl->op_buf_len) {
-        td_format_error(err, err_len, "rdma payload length too large");
-        return -1;
-    }
-
-    memcpy(impl->send_msg, msg, sizeof(*msg));
-    if (payload_len > 0 && payload != NULL) {
-        start_ns = copy_ns != NULL ? td_now_ns() : 0;
-        if (payload != impl->op_buf) {
-            memcpy(impl->op_buf, payload, payload_len);
-        }
-        if (copy_ns != NULL && start_ns != 0) {
-            *copy_ns += td_now_ns() - start_ns;
-        }
-    }
-
-    memset(&header_sge, 0, sizeof(header_sge));
-    header_sge.addr = (uintptr_t)impl->send_msg;
-    header_sge.length = sizeof(*impl->send_msg);
-    header_sge.lkey = impl->send_mr->lkey;
-
-    memset(&header_wr, 0, sizeof(header_wr));
-    header_wr.sg_list = &header_sge;
-    header_wr.num_sge = 1;
-    header_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    header_wr.send_flags = IBV_SEND_SIGNALED;
-    header_wr.imm_data = htonl((uint32_t)msg->op);
-    header_wr.wr.rdma.remote_addr = impl->remote_ctrl_addr;
-    header_wr.wr.rdma.rkey = impl->remote_ctrl_rkey;
-
-    if (payload_len > 0) {
-        if (impl->remote_op_addr == 0 || impl->remote_op_rkey == 0) {
-            td_format_error(err, err_len, "write_imm control path missing remote payload buffer metadata");
-            return -1;
-        }
-        memset(&payload_sge, 0, sizeof(payload_sge));
-        payload_sge.addr = (uintptr_t)impl->op_buf;
-        payload_sge.length = payload_len;
-        payload_sge.lkey = impl->op_mr->lkey;
-
-        memset(&payload_wr, 0, sizeof(payload_wr));
-        payload_wr.sg_list = &payload_sge;
-        payload_wr.num_sge = 1;
-        payload_wr.opcode = IBV_WR_RDMA_WRITE;
-        payload_wr.send_flags = 0;
-        payload_wr.wr.rdma.remote_addr = impl->remote_op_addr;
-        payload_wr.wr.rdma.rkey = impl->remote_op_rkey;
-        payload_wr.next = &header_wr;
-        first_wr = &payload_wr;
-    }
-
-    fprintf(stderr,
-        "[RDMA-DEBUG] post_write_imm op=%s(%u) qpn=%u payload_len=%zu ctrl_remote=0x%llx/%u op_remote=0x%llx/%u\n",
-        td_rdma_wire_op_name(msg->op),
-        (unsigned int)msg->op,
-        impl->qp != NULL ? impl->qp->qp_num : 0,
-        payload_len,
-        (unsigned long long)impl->remote_ctrl_addr,
-        impl->remote_ctrl_rkey,
-        (unsigned long long)impl->remote_op_addr,
-        impl->remote_op_rkey);
-    fflush(stderr);
-    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] pre-write-imm qp");
-
-    start_ns = post_send_ns != NULL ? td_now_ns() : 0;
-    if (ibv_post_send(impl->qp, first_wr, &bad_wr) != 0) {
-        td_format_error(err, err_len, "rdma write_imm message failed");
-        return -1;
-    }
-    if (post_send_ns != NULL && start_ns != 0) {
-        *post_send_ns += td_now_ns() - start_ns;
-    }
-
-    start_ns = send_wait_ns != NULL ? td_now_ns() : 0;
-    if (td_rdma_poll_wc(impl, IBV_WC_RDMA_WRITE, wait_profile, NULL, err, err_len) != 0) {
-        return -1;
-    }
-    fprintf(stderr, "[RDMA-DEBUG] write_imm completion op=%s qpn=%u\n",
-        td_rdma_wire_op_name(msg->op),
-        impl->qp != NULL ? impl->qp->qp_num : 0);
-    fflush(stderr);
-    if (send_wait_ns != NULL && start_ns != 0) {
-        *send_wait_ns += td_now_ns() - start_ns;
-    }
-    return 0;
-}
-
 static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, const void *payload, size_t payload_len, uint64_t *copy_ns, uint64_t *post_send_ns, uint64_t *send_wait_ns, td_rdma_wait_profile_t *wait_profile, char *err, size_t err_len) {
-    if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
-        return td_rdma_send_message_write_imm(impl, msg, payload, payload_len, copy_ns, post_send_ns, send_wait_ns, wait_profile, err, err_len);
-    }
     return td_rdma_send_message_sendrecv(impl, msg, payload, payload_len, copy_ns, post_send_ns, send_wait_ns, wait_profile, err, err_len);
 }
 

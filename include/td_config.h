@@ -5,6 +5,7 @@
 
 typedef enum {
     TD_RDMA_CONTROL_SEND = 0,
+    /* Deprecated compatibility value; normalized to SEND during config load. */
     TD_RDMA_CONTROL_WRITE_IMM = 1,
 } td_rdma_control_mode_t;
 

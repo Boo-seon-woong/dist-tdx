@@ -54,7 +54,8 @@ static int td_parse_rdma_control_mode(const char *value, td_rdma_control_mode_t 
         return 0;
     }
     if (strcmp(value, "write_imm") == 0 || strcmp(value, "rdma_write_with_imm") == 0) {
-        *out = TD_RDMA_CONTROL_WRITE_IMM;
+        /* Keep parsing the legacy knob, but normalize it to SEND/RECV. */
+        *out = TD_RDMA_CONTROL_SEND;
         return 0;
     }
     return -1;
@@ -294,7 +295,7 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->cache = TD_CACHE_ON;
     cfg->mn_memory_size = 64ULL * 1024ULL * 1024ULL;
     cfg->rdma_bootstrap = TD_RDMA_BOOTSTRAP_OOB_FILE;
-    cfg->rdma_control_mode = TD_RDMA_CONTROL_WRITE_IMM;
+    cfg->rdma_control_mode = TD_RDMA_CONTROL_SEND;
     cfg->rdma_data_mode = TD_RDMA_DATA_RPC;
     cfg->rdma_skip_hello = 0;
     cfg->rdma_gid_index = 0;
@@ -530,9 +531,9 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
         return -1;
     }
     if (cfg->transport == TD_TRANSPORT_RDMA &&
-        (cfg->rdma_control_mode == TD_RDMA_CONTROL_WRITE_IMM || cfg->rdma_skip_hello) &&
+        cfg->rdma_skip_hello &&
         cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
-        td_format_error(err, err_len, "rdma write_imm/skip_hello options currently require tcp or vsock bootstrap");
+        td_format_error(err, err_len, "rdma_skip_hello currently requires tcp or vsock bootstrap");
         return -1;
     }
     if (cfg->transport == TD_TRANSPORT_RDMA && cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_OOB_FILE) {
