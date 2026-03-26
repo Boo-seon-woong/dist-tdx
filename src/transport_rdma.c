@@ -1016,12 +1016,12 @@ static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_query_local_conn_info(impl, &local_msg.conn, err, err_len) != 0) {
         return -1;
     }
-    if (td_send_all(fd, &local_msg, sizeof(local_msg)) != 0) {
-        td_format_error(err, err_len, "rdma bootstrap send failed");
-        return -1;
-    }
     if (td_rdma_qp_to_rtr(impl, &remote_msg.conn, err, err_len) != 0 ||
         td_rdma_qp_to_rts(impl, err, err_len) != 0) {
+        return -1;
+    }
+    if (td_send_all(fd, &local_msg, sizeof(local_msg)) != 0) {
+        td_format_error(err, err_len, "rdma bootstrap send failed");
         return -1;
     }
     return 0;
