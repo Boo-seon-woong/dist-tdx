@@ -132,10 +132,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "config error: mode must be mn\n");
         return 1;
     }
+    fprintf(stderr, "[MN-DEBUG] opening region transport=%s tdx=%s bytes=%llu\n",
+        cfg.transport == TD_TRANSPORT_RDMA ? "rdma" : "tcp",
+        cfg.tdx == TD_TDX_ON ? "on" : "off",
+        (unsigned long long)cfg.mn_memory_size);
+    fflush(stderr);
     if (td_region_open(&region, &cfg, err, sizeof(err)) != 0) {
         fprintf(stderr, "region error: %s\n", err);
         return 1;
     }
+    fprintf(stderr, "[MN-DEBUG] region opened successfully\n");
+    fflush(stderr);
 
     signal(SIGINT, td_signal_handler);
     signal(SIGTERM, td_signal_handler);

@@ -658,6 +658,10 @@ static int td_rdma_register_shared_buffer_mr(td_rdma_impl_t *impl, void *base, s
 }
 
 static int td_rdma_register_server_region(td_rdma_server_conn_t *conn, char *err, size_t err_len) {
+    fprintf(stderr, "[MN-DEBUG] registering shared region MR base=%p bytes=%zu\n",
+        td_region_shared_base(conn->region),
+        td_region_shared_bytes(conn->region));
+    fflush(stderr);
     conn->region_mr = ibv_reg_mr(
         conn->impl.pd,
         td_region_shared_base(conn->region),
@@ -667,6 +671,10 @@ static int td_rdma_register_server_region(td_rdma_server_conn_t *conn, char *err
         td_format_error(err, err_len, "rdma shared region registration failed");
         return -1;
     }
+    fprintf(stderr, "[MN-DEBUG] shared region MR registered lkey=%u rkey=%u\n",
+        conn->region_mr->lkey,
+        conn->region_mr->rkey);
+    fflush(stderr);
     return 0;
 }
 

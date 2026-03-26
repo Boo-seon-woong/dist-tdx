@@ -19,6 +19,7 @@ typedef struct td_tdx_shmem_req {
 enum {
     TD_TDX_SHMEM_IOCTL_CONVERT = _IOW('t', 1, td_tdx_shmem_req_t),
     TD_TDX_SHMEM_IOCTL_REVERT = _IOW('t', 2, td_tdx_shmem_req_t),
+    TD_TDX_SHMEM_CHUNK_BYTES = 16 * 4096,
 };
 
 static const char td_tdx_shmem_device[] = "/dev/tdx_shmem";
@@ -144,6 +145,8 @@ static int td_tdx_call_with_retry(td_tdx_runtime_t *runtime, td_tdcall_leaf_t le
 
 static int td_tdx_shared_ioctl(td_tdx_runtime_t *runtime, unsigned long request, void *base, size_t bytes, char *err, size_t err_len) {
     td_tdx_shmem_req_t shm_req;
+    uintptr_t cursor;
+    uintptr_t end;
     int fd;
     int rc;
     int saved_errno;
@@ -161,19 +164,30 @@ static int td_tdx_shared_ioctl(td_tdx_runtime_t *runtime, unsigned long request,
         return -1;
     }
 
-    shm_req.addr = base;
-    shm_req.size = bytes;
-    rc = ioctl(fd, request, &shm_req);
-    saved_errno = errno;
-    close(fd);
-    if (rc != 0) {
-        td_format_error(err, err_len, "ioctl %s failed for %p+%zu: %s",
-            request == TD_TDX_SHMEM_IOCTL_CONVERT ? "CONVERT" : "REVERT",
-            base,
-            bytes,
-            strerror(saved_errno));
-        return -1;
+    cursor = (uintptr_t)base;
+    end = cursor + bytes;
+    while (cursor < end) {
+        size_t chunk = (size_t)(end - cursor);
+
+        if (chunk > TD_TDX_SHMEM_CHUNK_BYTES) {
+            chunk = TD_TDX_SHMEM_CHUNK_BYTES;
+        }
+        shm_req.addr = (void *)cursor;
+        shm_req.size = chunk;
+        rc = ioctl(fd, request, &shm_req);
+        saved_errno = errno;
+        if (rc != 0) {
+            close(fd);
+            td_format_error(err, err_len, "ioctl %s failed for %p+%zu: %s",
+                request == TD_TDX_SHMEM_IOCTL_CONVERT ? "CONVERT" : "REVERT",
+                (void *)cursor,
+                chunk,
+                strerror(saved_errno));
+            return -1;
+        }
+        cursor += chunk;
     }
+    close(fd);
     return 0;
 }
 
