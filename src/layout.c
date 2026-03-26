@@ -180,6 +180,7 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     void *mapped;
     td_region_header_t *header;
     int force_shared_region = 0;
+    int convert_after_init = 0;
 
     memset(region, 0, sizeof(*region));
     region->shared.fd = -1;
@@ -207,14 +208,9 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
             }
             fprintf(stderr, "[MN-DEBUG] shared region mapped base=%p bytes=%zu\n", mapped, bytes);
             fflush(stderr);
-            if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
-                td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
-                return -1;
-            }
-            fprintf(stderr, "[MN-DEBUG] shared region converted base=%p bytes=%zu\n", mapped, bytes);
-            fflush(stderr);
             region->shared.anonymous_mapping = 1;
-            region->shared.shared_converted = 1;
+            region->shared.shared_converted = 0;
+            convert_after_init = 1;
             snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
         }
     } else {
@@ -245,7 +241,9 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     region->shared.mapped_bytes = bytes;
     pthread_mutex_init(td_region_private_lock(region), NULL);
 
-    memset(region->shared.base, 0, bytes);
+    if (!region->shared.anonymous_mapping) {
+        memset(region->shared.base, 0, bytes);
+    }
     header = td_region_header_mut(region);
     memset(header, 0, sizeof(*header));
     header->prime_slot_count = cfg->prime_slots;
@@ -260,6 +258,17 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
         td_region_alloc_slot_state(&region->private_state.backup_slot_state, (size_t)header->backup_slot_count, err, err_len) != 0) {
         td_region_close(region);
         return -1;
+    }
+    if (convert_after_init) {
+        if (td_tdx_accept_shared_memory(&region->shared.tdx, region->shared.base, region->shared.mapped_bytes, err, err_len) != 0) {
+            td_region_close(region);
+            return -1;
+        }
+        region->shared.shared_converted = 1;
+        fprintf(stderr, "[MN-DEBUG] shared region converted after initialization base=%p bytes=%zu\n",
+            region->shared.base,
+            region->shared.mapped_bytes);
+        fflush(stderr);
     }
     return 0;
 }
