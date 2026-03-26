@@ -33,6 +33,7 @@ typedef enum {
     TD_RDMA_MIN_OP_SEND = 0,
     TD_RDMA_MIN_OP_WRITE = 1,
     TD_RDMA_MIN_OP_WRITE_IMM = 2,
+    TD_RDMA_MIN_OP_READ = 3,
 } td_rdma_min_op_t;
 
 typedef struct {
@@ -113,8 +114,8 @@ typedef struct {
 static void td_rdma_min_usage(const char *argv0) {
     fprintf(stderr,
         "usage:\n"
-        "  %s --mode server --listen <ip> --tcp-port <port> --rdma-device <dev> [--rdma-port N] [--gid-index N] [--tdx on|off] [--op send|write|write_imm] [--bytes N] [--timeout-ms N]\n"
-        "  %s --mode client --connect <ip> --tcp-port <port> --rdma-device <dev> [--rdma-port N] [--gid-index N] [--op send|write|write_imm] [--bytes N] [--timeout-ms N]\n",
+        "  %s --mode server --listen <ip> --tcp-port <port> --rdma-device <dev> [--rdma-port N] [--gid-index N] [--tdx on|off] [--op send|write|write_imm|read] [--bytes N] [--timeout-ms N]\n"
+        "  %s --mode client --connect <ip> --tcp-port <port> --rdma-device <dev> [--rdma-port N] [--gid-index N] [--op send|write|write_imm|read] [--bytes N] [--timeout-ms N]\n",
         argv0,
         argv0);
 }
@@ -131,6 +132,8 @@ static const char *td_rdma_min_op_name(td_rdma_min_op_t op) {
             return "write";
         case TD_RDMA_MIN_OP_WRITE_IMM:
             return "write_imm";
+        case TD_RDMA_MIN_OP_READ:
+            return "read";
     }
     return "unknown";
 }
@@ -141,6 +144,8 @@ static const char *td_rdma_min_wc_opcode_name(enum ibv_wc_opcode opcode) {
             return "SEND";
         case IBV_WC_RDMA_WRITE:
             return "RDMA_WRITE";
+        case IBV_WC_RDMA_READ:
+            return "RDMA_READ";
         case IBV_WC_RECV:
             return "RECV";
         case IBV_WC_RECV_RDMA_WITH_IMM:
@@ -185,6 +190,10 @@ static int td_rdma_min_parse_op(const char *text, td_rdma_min_op_t *out) {
     }
     if (strcmp(text, "write_imm") == 0) {
         *out = TD_RDMA_MIN_OP_WRITE_IMM;
+        return 0;
+    }
+    if (strcmp(text, "read") == 0) {
+        *out = TD_RDMA_MIN_OP_READ;
         return 0;
     }
     return -1;
@@ -234,7 +243,7 @@ static int td_rdma_min_parse_args(int argc, char **argv, td_rdma_min_options_t *
 
     memset(opts, 0, sizeof(*opts));
     opts->mode = TD_RDMA_MIN_MODE_SERVER;
-    opts->op = TD_RDMA_MIN_OP_WRITE_IMM;
+    opts->op = TD_RDMA_MIN_OP_WRITE;
     opts->rdma_port_num = 1;
     opts->gid_index = 0;
     opts->tdx = TD_TDX_OFF;
@@ -668,6 +677,8 @@ static int td_rdma_min_qp_to_init(td_rdma_min_ctx_t *ctx, td_rdma_min_op_t op, c
     attr.pkey_index = 0;
     if (op == TD_RDMA_MIN_OP_WRITE || op == TD_RDMA_MIN_OP_WRITE_IMM) {
         access_flags |= IBV_ACCESS_REMOTE_WRITE;
+    } else if (op == TD_RDMA_MIN_OP_READ) {
+        access_flags |= IBV_ACCESS_REMOTE_READ;
     }
     attr.qp_access_flags = access_flags;
     if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
@@ -892,6 +903,8 @@ static int td_rdma_min_init_ctx(td_rdma_min_ctx_t *ctx, const td_rdma_min_option
         data_access |= IBV_ACCESS_REMOTE_WRITE;
     } else if (opts->op == TD_RDMA_MIN_OP_WRITE) {
         data_access |= IBV_ACCESS_REMOTE_WRITE;
+    } else if (opts->op == TD_RDMA_MIN_OP_READ) {
+        data_access |= IBV_ACCESS_REMOTE_READ;
     }
 
     if (td_rdma_min_register_mr(ctx, &ctx->send_buf, IBV_ACCESS_LOCAL_WRITE, &ctx->send_mr, err, err_len) != 0 ||
@@ -1093,6 +1106,37 @@ static int td_rdma_min_post_write_imm(td_rdma_min_ctx_t *ctx, const td_rdma_min_
     return 0;
 }
 
+static int td_rdma_min_post_read(td_rdma_min_ctx_t *ctx, const td_rdma_min_bootstrap_t *remote, char *err, size_t err_len) {
+    struct ibv_sge sge;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *bad_wr = NULL;
+
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = (uintptr_t)ctx->data_buf.base;
+    sge.length = (uint32_t)ctx->data_buf.bytes;
+    sge.lkey = ctx->data_mr->lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remote->data_addr;
+    wr.wr.rdma.rkey = remote->data_rkey;
+
+    if (ibv_post_send(ctx->qp, &wr, &bad_wr) != 0) {
+        td_format_error(err, err_len, "ibv_post_send RDMA_READ failed");
+        return -1;
+    }
+    fprintf(stderr, "[MIN-RDMA] post_read qpn=%u bytes=%zu remote=0x%llx/%u\n",
+        ctx->qp->qp_num,
+        ctx->data_buf.bytes,
+        (unsigned long long)remote->data_addr,
+        remote->data_rkey);
+    fflush(stderr);
+    return 0;
+}
+
 static int td_rdma_min_wait_for_remote_write(td_rdma_min_ctx_t *ctx, unsigned int timeout_ms, char *err, size_t err_len) {
     uint64_t deadline_ns = td_now_ns() + ((uint64_t)timeout_ms * 1000000ULL);
     uint64_t next_log_ns = td_now_ns() + 1000000000ULL;
@@ -1118,6 +1162,20 @@ static int td_rdma_min_wait_for_remote_write(td_rdma_min_ctx_t *ctx, unsigned in
     td_rdma_min_hexdump("[MIN-RDMA] timed out server data buffer", ctx->data_buf.base, ctx->data_buf.bytes);
     td_format_error(err, err_len, "timed out waiting for remote data buffer change");
     return -1;
+}
+
+static int td_rdma_min_expect_pattern(const void *buf, size_t bytes, char *err, size_t err_len) {
+    static const unsigned char pattern[] = "rdma-min";
+    const unsigned char *data = (const unsigned char *)buf;
+    size_t idx;
+
+    for (idx = 0; idx < bytes; ++idx) {
+        if (data[idx] != pattern[idx % (sizeof(pattern) - 1)]) {
+            td_format_error(err, err_len, "data pattern mismatch at offset %zu", idx);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int td_rdma_min_server(const td_rdma_min_options_t *opts, char *err, size_t err_len) {
@@ -1153,6 +1211,12 @@ static int td_rdma_min_server(const td_rdma_min_options_t *opts, char *err, size
     if (fd < 0) {
         goto done;
     }
+    if (opts->op == TD_RDMA_MIN_OP_READ) {
+        memset(ctx.data_buf.base, 0, ctx.data_buf.bytes);
+        td_rdma_min_fill_pattern(ctx.data_buf.base, ctx.data_buf.bytes);
+        td_rdma_min_hexdump("[MIN-RDMA] server read seed buffer", ctx.data_buf.base, ctx.data_buf.bytes);
+    }
+
     if (opts->op == TD_RDMA_MIN_OP_SEND) {
         if (td_rdma_min_post_recv(&ctx, sizeof(td_rdma_min_msg_t) + opts->bytes, err, err_len) != 0) {
             goto done;
@@ -1187,7 +1251,7 @@ static int td_rdma_min_server(const td_rdma_min_options_t *opts, char *err, size
             goto done;
         }
         td_rdma_min_hexdump("[MIN-RDMA] server data buffer", ctx.data_buf.base, ctx.data_buf.bytes);
-    } else {
+    } else if (opts->op == TD_RDMA_MIN_OP_WRITE_IMM) {
         td_rdma_min_msg_t *msg;
 
         if (td_rdma_min_poll_wc(&ctx, IBV_WC_RECV, opts->timeout_ms, &wc, err, err_len) != 0) {
@@ -1202,6 +1266,15 @@ static int td_rdma_min_server(const td_rdma_min_options_t *opts, char *err, size
             ntohl(wc.imm_data));
         td_rdma_min_hexdump("[MIN-RDMA] server ctrl buffer", ctx.ctrl_buf.base, ctx.ctrl_buf.bytes);
         td_rdma_min_hexdump("[MIN-RDMA] server data buffer", ctx.data_buf.base, ctx.data_buf.bytes);
+    } else {
+        unsigned char ack = 0;
+
+        if (td_rdma_min_recv_all(fd, &ack, sizeof(ack)) != 0) {
+            td_format_error(err, err_len, "read completion ack receive failed");
+            goto done;
+        }
+        fprintf(stderr, "[MIN-RDMA] server received read completion ack=0x%02x\n", ack);
+        fflush(stderr);
     }
 
     rc = 0;
@@ -1304,7 +1377,7 @@ static int td_rdma_min_client(const td_rdma_min_options_t *opts, char *err, size
         if (td_rdma_min_poll_wc(&ctx, IBV_WC_RDMA_WRITE, opts->timeout_ms, &wc, err, err_len) != 0) {
             goto done;
         }
-    } else {
+    } else if (opts->op == TD_RDMA_MIN_OP_WRITE_IMM) {
         td_rdma_min_msg_t *msg = (td_rdma_min_msg_t *)ctx.ctrl_buf.base;
 
         memset(ctx.ctrl_buf.base, 0, ctx.ctrl_buf.bytes);
@@ -1320,6 +1393,24 @@ static int td_rdma_min_client(const td_rdma_min_options_t *opts, char *err, size
             goto done;
         }
         if (td_rdma_min_poll_wc(&ctx, IBV_WC_RDMA_WRITE, opts->timeout_ms, &wc, err, err_len) != 0) {
+            goto done;
+        }
+    } else {
+        unsigned char ack = 0xa5;
+
+        memset(ctx.data_buf.base, 0, ctx.data_buf.bytes);
+        if (td_rdma_min_post_read(&ctx, &remote, err, err_len) != 0) {
+            goto done;
+        }
+        if (td_rdma_min_poll_wc(&ctx, IBV_WC_RDMA_READ, opts->timeout_ms, &wc, err, err_len) != 0) {
+            goto done;
+        }
+        td_rdma_min_hexdump("[MIN-RDMA] client read payload", ctx.data_buf.base, ctx.data_buf.bytes);
+        if (td_rdma_min_expect_pattern(ctx.data_buf.base, ctx.data_buf.bytes, err, err_len) != 0) {
+            goto done;
+        }
+        if (td_rdma_min_send_all(fd, &ack, sizeof(ack)) != 0) {
+            td_format_error(err, err_len, "read completion ack send failed");
             goto done;
         }
     }

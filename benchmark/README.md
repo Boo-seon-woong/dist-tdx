@@ -46,7 +46,7 @@ make
 - TCP bootstrap
 - RC QP 연결
 - small MR 등록
-- `send`, `write`, `write_imm` 중 하나의 단발 RDMA 연산
+- `write`, `read`, `send`, `write_imm` 중 하나의 단발 RDMA 연산
 
 Server 쪽은 TDX guest에서 `--tdx on`으로 실행하면 `/dev/tdx_shmem` shared-convert 경로를 그대로 사용한다.
 
@@ -67,7 +67,7 @@ Guest server 예시:
   --rdma-port 1 \
   --gid-index 0 \
   --tdx on \
-  --op write_imm \
+  --op write \
   --bytes 32
 ```
 
@@ -81,12 +81,20 @@ Native client 예시:
   --rdma-device ibp23s0 \
   --rdma-port 1 \
   --gid-index 0 \
-  --op write_imm \
+  --op write \
   --bytes 32
 ```
 
 연산별 기대 결과:
 
-- `send`: server가 `RECV` completion과 payload dump를 찍음
 - `write`: client가 `RDMA_WRITE` local completion을 받고 server data buffer가 바뀜
+- `read`: server가 seed한 data buffer를 client가 `RDMA_READ` completion 뒤 동일하게 읽어옴
+- `send`: server가 `RECV` completion과 payload dump를 찍음
 - `write_imm`: client가 `RDMA_WRITE` local completion을 받고 server가 `RECV_RDMA_WITH_IMM` completion과 ctrl/data buffer dump를 찍음
+
+권장 확인 순서:
+
+- `write`
+- `read`
+- `send`
+- `write_imm`
