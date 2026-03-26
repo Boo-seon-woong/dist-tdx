@@ -1095,6 +1095,7 @@ static int td_rdma_min_post_write_imm(td_rdma_min_ctx_t *ctx, const td_rdma_min_
 
 static int td_rdma_min_wait_for_remote_write(td_rdma_min_ctx_t *ctx, unsigned int timeout_ms, char *err, size_t err_len) {
     uint64_t deadline_ns = td_now_ns() + ((uint64_t)timeout_ms * 1000000ULL);
+    uint64_t next_log_ns = td_now_ns() + 1000000000ULL;
 
     while (td_now_ns() < deadline_ns) {
         const unsigned char *data = (const unsigned char *)ctx->data_buf.base;
@@ -1107,8 +1108,14 @@ static int td_rdma_min_wait_for_remote_write(td_rdma_min_ctx_t *ctx, unsigned in
                 return 0;
             }
         }
+        if (td_now_ns() >= next_log_ns) {
+            fprintf(stderr, "[MIN-RDMA] still waiting for remote data buffer change\n");
+            td_rdma_min_hexdump("[MIN-RDMA] current server data buffer", ctx->data_buf.base, ctx->data_buf.bytes);
+            next_log_ns += 1000000000ULL;
+        }
         sched_yield();
     }
+    td_rdma_min_hexdump("[MIN-RDMA] timed out server data buffer", ctx->data_buf.base, ctx->data_buf.bytes);
     td_format_error(err, err_len, "timed out waiting for remote data buffer change");
     return -1;
 }
