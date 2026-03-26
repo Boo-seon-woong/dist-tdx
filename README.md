@@ -1,91 +1,241 @@
 # dist-tdx
 
-`dist-tdx` is the TDX-focused refactoring branch of `dist-td`.
+`dist-tdx` is an RDMA-capable branch of `dist-td` for the case where:
 
-The main problem is not "how to make RDMA use IP" but "how to keep RDMA on the InfiniBand fabric while respecting TDX shared/private memory boundaries".
+- the `MN` runs inside an Intel TDX guest
+- the `CN` runs outside the guest
+- only shared memory is allowed to be RDMA-visible
+- MN-private metadata must remain non-RDMA-visible
 
-## Current direction
+This repository currently supports both TCP and RDMA transports, but the TDX+RDMA path has an important known limitation documented below.
 
-- MN runs inside an Intel TDX guest.
-- CN remains outside the TDX trust boundary.
-- RDMA directly registers the MN shared slot region as a remote-visible MR, while control messages still use small shared-visible local buffers.
-- MN metadata, eviction state, and other control-plane state stay private.
+## Current Status
 
-## RDMA connection model
+As of 2026-03-26:
 
-RDMA data path no longer depends on IPoIB and does not require `rdma_cm`.
+- TCP bootstrap works
+- RDMA QP setup works
+- TDX full shared-region conversion during MN startup works
+- shared control buffers are converted and MR-registered
+- optional direct shared-region MR registration sometimes works and sometimes fails with `Input/output error`
+- CN can skip `HELLO` and use bootstrap metadata directly
+- RPC fallback for `READ/WRITE` is implemented
 
-- Data plane: manual verbs RC QP setup plus direct `RDMA_READ`/`RDMA_WRITE` against the MN shared slot region.
-- Control path: RC `SEND/RECV` messages for `HELLO`, `CAS`, eviction, and shutdown.
-- Preferred bootstrap plane for the current `run_td` host/guest deployment: TCP bootstrap over QEMU user-net host forwarding.
-- Optional shared-filesystem bootstrap plane: file-based OOB rendezvous through a directory that is truly shared between CN and MN.
-- Optional bootstrap plane: `vsock`, when the host can reach the guest CID in that QEMU/TDX environment.
+What still does not work reliably in the current external-CN -> TDX-guest-MN deployment:
 
-The OOB rendezvous exchanges the minimum RC connection state:
+- inbound RDMA traffic into the guest shared buffers
+- end-to-end `read/write/update/delete` over RDMA
 
-- `LID`
-- `QPN`
-- `PSN`
-- `MTU`
-- `GID` when the fabric path needs GRH/GID addressing
+In practice, this means the code is past the obvious application-layer failures, but the actual guest RDMA target path is still blocked.
 
-Implication:
+## Build
 
-- `ibstat` showing `State: Active` and a valid `SM lid` is enough for verbs-level RDMA setup on InfiniBand.
-- `ip link show` reporting the IB netdev as `DOWN` does not by itself block verbs RDMA.
-- IPoIB is not required unless a separate IP-based management path is explicitly chosen.
+Requirements:
 
-## Config meaning
+- C compiler available as `cc`
+- `libibverbs`
+- `pthread`
+- OpenSSL `libcrypto`
 
-For `transport: rdma` with `rdma_bootstrap: file`:
+Build:
 
-- `rdma_oob_dir`: shared directory used for QP attribute rendezvous
-- `mn_node_id`: CN-side target MN identifier
-- `node_id`: MN-side local node identifier
-- `rdma_device`: local device name for that process, either a verbs device name such as `mlx5_0` or a local netdev such as `ibp1s0` or `ibs3`
-- `rdma_port_num`: verbs port number to use on that device
-- `rdma_gid_index`: only needed when the fabric path requires a GRH/GID-based address
+```bash
+make
+```
 
-Important:
+Binaries:
 
-- creating `/shared/...` manually inside the guest is not enough
-- `rdma_oob_dir` must be backed by the same shared filesystem on both host CN and guest MN
-- the current `run_td` script does not set up that shared filesystem automatically
+- `bin/mn`
+- `bin/cn`
+- `bin/cn_bench`
 
-For `transport: rdma` with `rdma_bootstrap: tcp`:
+## Architecture
 
-- `listen_host` / `listen_port`: TCP bootstrap listener on the MN side
-- `mn_endpoint`: TCP bootstrap endpoint on the CN side
-- for same-host testing, `run_td --tcp-hostfwd-ports 7301` lets the host CN use `mn_endpoint: 127.0.0.1:7301`
-- for an external CN server, bind the forward on the host that actually runs `run_td`; in the current deployment that host is `simba`, so use `run_td --tcp-hostfwd-ports 7301 --tcp-hostfwd-bind-addr 10.20.18.199`, then point the CN to `mn_endpoint: 10.20.18.199:7301`
-- sample files:
-  `build/config/cn.rdma.local*.conf` are for same-host testing on the `run_td` host
-  `build/config/cn.rdma*.conf` currently match the `genie` CN to `simba` TDX-host deployment
+### Memory model
 
-For `transport: rdma` with `rdma_bootstrap: vsock`:
+The design splits MN state into:
 
-- `listen_port`: vsock listener port on the MN side
-- `mn_endpoint`: `guest_cid:port` on the CN side
-- in some QEMU/TDX combinations the host may still fail to route to the guest CID, so this path is optional rather than assumed
+- shared slot region
+- private metadata
 
-## TDX memory model
+The shared slot region contains the user-visible slot storage. Private metadata includes eviction/accounting state that must not be exposed through RDMA.
 
-- Shared slot storage is separated from private metadata.
-- Slot header/body visible to RDMA remain in the shared region.
-- MN-only sidecar metadata remains private.
+For TDX+RDMA:
 
-Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers safe in Linux guests.
+- the slot region is mapped through the TDX shared-memory helper
+- the region is converted to shared memory after initialization
+- small RDMA control buffers are also mapped in shared memory
 
-- The code can probe TDX with a real `tdcall` backend when built with `TDX_REAL_TDCALL=1`.
-- Safe private/shared handling for DMA registration is delegated to the guest's validated external converter device at `/dev/tdx_shmem`.
-- `td_tdx_map_shared_memory()` provides the shared-anonymous VMA, and `td_tdx_accept_shared_memory()` / `td_tdx_release_shared_memory()` drive the actual private/shared transition through that device.
-- The shared slot region is converted before MR registration and exposed as the remote-visible RDMA window.
-- Small control buffers are also converted and registered so the guest-side NIC never DMA-touches private pages.
-- `rdma_region_segment_bytes` is retained only for backward config compatibility and is currently unused by the slot-sized direct RDMA path.
-- This model assumes the guest has the external shared-memory convert path installed and validated, matching the `~/2026/share` prototype.
+The current code enables full shared-region conversion by default for TDX+RDMA. To disable that behavior explicitly:
 
-## Non-goals
+```bash
+DISTTDX_FORCE_SHARED_REGION=0 ./bin/mn --config build/config/mn.rdma.off.conf
+```
 
-- No TDCALL in the RDMA hot path.
-- No RDMA access to private metadata.
-- No dependency on IPoIB for the RDMA data plane.
+### RDMA model
+
+There are two independent choices in the RDMA path.
+
+Control path:
+
+- `send`
+- `write_imm`
+
+Data path:
+
+- `direct`
+- `rpc`
+
+Current recommended config for the real TDX deployment uses:
+
+- `rdma_control_mode: write_imm`
+- `rdma_data_mode: rpc`
+- `rdma_skip_hello: on`
+
+Meaning:
+
+- control operations use `RDMA_WRITE_WITH_IMM`
+- `READ/WRITE` are issued as RPCs instead of one-sided direct region access
+- CN skips `HELLO` and uses bootstrap metadata directly
+
+## Config Files
+
+Available sample configs:
+
+- `build/config/mn.rdma.conf`
+- `build/config/mn.rdma.off.conf`
+- `build/config/cn.rdma.conf`
+- `build/config/cn.rdma.off.conf`
+- `build/config/cn.rdma.local.conf`
+- `build/config/cn.rdma.local.off.conf`
+
+The `*.off.conf` files disable the application cache. The `local` CN configs are for same-host bootstrap testing; the non-`local` CN configs match the external `genie` -> TDX guest deployment.
+
+## Important Config Keys
+
+Common:
+
+- `transport: tcp|rdma`
+- `tdx: on|off`
+- `mn_memory_size`
+- `cache: on|off`
+
+RDMA:
+
+- `rdma_bootstrap: tcp|file|vsock`
+- `rdma_device`
+- `rdma_port_num`
+- `rdma_gid_index`
+- `rdma_control_mode: send|write_imm`
+- `rdma_data_mode: direct|rpc`
+- `rdma_skip_hello: on|off`
+
+TCP bootstrap:
+
+- MN:
+  - `listen_host`
+  - `listen_port`
+- CN:
+  - `mn_endpoint`
+
+OOB file bootstrap:
+
+- `rdma_oob_dir`
+- `node_id`
+
+## Current Deployment Notes
+
+The deployment currently being debugged is:
+
+- CN host: `genie`
+- MN: TDX guest
+- TCP bootstrap endpoint exposed via the host that runs `run_td`
+
+Guest-side RDMA device:
+
+- `ibp1s0`
+
+CN-side RDMA device:
+
+- `ibp23s0`
+
+Example TDX launch used in this setup:
+
+```bash
+sudo /home/seonung/2026/tdx/guest-tools/run_td \
+  --rdma-nics 0000:6f:00.0 \
+  --sm-mode external \
+  --tcp-hostfwd-ports 7301 \
+  --tcp-hostfwd-bind-addr 10.20.18.199
+```
+
+Example runtime commands:
+
+MN inside guest:
+
+```bash
+./bin/mn --config build/config/mn.rdma.off.conf
+```
+
+CN on `genie`:
+
+```bash
+./bin/cn --config build/config/cn.rdma.off.conf
+```
+
+## What Works Today
+
+- MN startup in TDX guest
+- shared slot-region creation and conversion
+- RDMA bootstrap metadata exchange
+- RC QP transition to `RTR/RTS`
+- shared control-buffer registration
+- `rdma_skip_hello: on`
+- mode selection and debug logging for `direct` vs `rpc`
+
+## Known Limitation
+
+The main unresolved issue is this:
+
+- external CN still cannot complete inbound RDMA operations targeting the TDX guest shared userspace buffers
+
+Symptoms:
+
+- CN can connect and enter the CLI
+- first `read` or `write` over RDMA stalls or fails
+- MN sees no corresponding completion
+
+This affects both:
+
+- earlier `SEND/RECV`-based control flow
+- current `write_imm + rpc` control/data flow
+
+So the active blocker appears to be the guest RDMA target path itself, not the higher-level `dist-tdx` protocol design.
+
+## Recommended Way To Read Current Logs
+
+During connection, these lines are the highest-signal ones:
+
+- `impl modes control=... data=... skip_hello=...`
+- `bootstrap ... local ...`
+- `bootstrap ... remote ...`
+- `qp->RTR ...`
+- `qp->RTS ...`
+- `using direct RDMA region path ...`
+- `using RDMA RPC fallback for READ/WRITE ...`
+- `post_write_imm ...`
+- `waiting for CQ completion ...`
+
+If `data=rpc` is configured and the log still shows direct-path behavior, the binary is stale.
+
+## Debugging Guidance
+
+When debugging the current environment, separate the problem into layers:
+
+1. TDX shared conversion
+2. MR registration
+3. bootstrap metadata exchange
+4. QP state transitions
+5. inbound RDMA completion into guest shared buffers
+
+The project is currently blocked at layer 5.

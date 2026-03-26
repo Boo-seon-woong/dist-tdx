@@ -1,101 +1,213 @@
-# dist-tdx Current Status and Open Problem
+# dist-tdx Problem Status
 
 Date: 2026-03-26
 
-## Goal
+## Summary
 
-Refactor `dist-tdx` so the CN can access the MN shared slot region through direct RDMA while the MN runs inside a TDX guest and private metadata remains non-RDMA-visible.
+`dist-tdx` now gets past:
 
-## Work Completed
+- TDX guest region creation
+- full shared-region conversion
+- RDMA QP bootstrap
+- control-buffer MR registration
+- optional direct shared-region MR registration
+- CN startup without `HELLO`
 
-- Reintroduced direct RDMA `READ/WRITE` for the shared slot region while keeping `HELLO/CAS/EVICT/CLOSE` on `SEND/RECV` control messages.
-- Restored `remote_addr` / `rkey` exchange in the RDMA `HELLO` path.
-- Wired the TDX runtime to use the validated external shared-memory conversion device `/dev/tdx_shmem` instead of leaving `accept/release` as stubs.
-- Converted RDMA-local control buffers before MR registration.
-- Converted the MN shared region during region open so it can be exposed as an RDMA-visible window.
-- Added `MADV_NOHUGEPAGE` to the shared mapping path.
-- Changed `/dev/tdx_shmem` conversion requests to run in 64KB chunks instead of converting the full range in one ioctl.
-- Added temporary `[MN-DEBUG]` logging around region open and shared-region MR registration.
+The active blocker is still the same end-to-end requirement:
 
-## Previously Observed Failure
+- `read/write/update/delete` do not yet work between external CN and TDX guest MN over RDMA
 
-Initial behavior after wiring region-wide shared conversion:
+At this point the failure is no longer explained by config mismatch, TCP bootstrap, or missing shared conversion. The remaining failure is in the actual RDMA packet/data path into the TDX guest.
 
-- Guest command:
-  `./bin/mn --config build/config/mn.rdma.off.conf`
-- Output stopped at:
-  `[MN-DEBUG] opening region transport=rdma tdx=on bytes=16777216`
-- The TDX VM became unreachable immediately after that point.
+## Current Deployment
 
-Interpretation:
+- `genie`: CN host
+- TDX guest: MN
+- TDX guest launched from the host with:
 
-- The guest was dying during `td_region_open()`, before RDMA bootstrap and before `ibv_reg_mr()`.
-- The most likely failure point was region-wide shared conversion inside `td_tdx_accept_shared_memory()`.
-
-## Current Behavior
-
-After adding `MADV_NOHUGEPAGE` and chunked conversion, the guest no longer dies immediately.
-
-MN-side output:
-
-```text
-dist-td mn node_id=0 transport=rdma bootstrap=tcp 0.0.0.0:7301 rdma_device=ibp1s0 rdma_port=1 gid_index=0 segment_bytes=16777216 backing=[anonymous-shm] bytes=17179869184
-dist-td mn runtime=tdx-emulated shared_only_exposure=yes
-dist-td mn layout mode=auto shared=16GB(17179869184) private_meta=49941600B prime=22196214:7635497616B cache=5549053:1908874232B backup=22196213:7635497272B used=17179869120B unused=64B slot_bytes=344
-rdma connection setup failed: ibv_reg_mr failed for region segment 1/1024 offset=0 length=16777224: Input/output error
+```bash
+sudo /home/seonung/2026/tdx/guest-tools/run_td \
+  --rdma-nics 0000:6f:00.0 \
+  --sm-mode external \
+  --tcp-hostfwd-ports 7301 \
+  --tcp-hostfwd-bind-addr 10.20.18.199
 ```
 
-CN-side output:
+- Guest RDMA device: `ibp1s0`
+- CN RDMA device: `ibp23s0`
+- Active configs:
+  - `build/config/mn.rdma.off.conf`
+  - `build/config/cn.rdma.off.conf`
+
+## Current Config Direction
+
+The current `.conf` files intentionally use:
+
+- `rdma_bootstrap: tcp`
+- `rdma_control_mode: write_imm`
+- `rdma_data_mode: rpc`
+- `rdma_skip_hello: on`
+
+Meaning:
+
+- bootstrap is TCP
+- control messages use `RDMA_WRITE_WITH_IMM`
+- `READ/WRITE` use RPC fallback instead of one-sided direct region access
+- CN does not send a separate `HELLO`
+
+Also, `DISTTDX_FORCE_SHARED_REGION` currently defaults to enabled in code for TDX+RDMA. Unless explicitly set to `0`, the MN tries to convert the full slot region to shared memory during startup.
+
+## What Has Been Verified
+
+### 1. Full shared-region conversion works
+
+The guest no longer crashes during region open.
+
+Observed MN log:
 
 ```text
-[DEBUG] connecting to 10.20.18.199:7301...
-[DEBUG] TCP connected, setting up QP...
-[DEBUG] QP setup done, exchanging bootstrap...
-[DEBUG] bootstrap done, local lid=2 qpn=81 psn=8268449
+[MN-DEBUG] shared region mapped base=... bytes=16777216
+[MN-DEBUG] shared region converted after initialization base=... bytes=16777216
+[MN-DEBUG] region opened successfully
+```
+
+This means the earlier crash was caused by conversion timing during initialization, not by the concept of full-region conversion itself.
+
+### 2. Direct region MR registration is not reliable
+
+Two states have been observed:
+
+- sometimes full shared-region `ibv_reg_mr()` succeeds
+- sometimes it fails with:
+
+```text
+[MN-WARN] shared region MR registration failed: Input/output error; falling back to SEND/RECV path for READ/WRITE
+```
+
+So direct-region exposure in the guest is not stable enough to rely on.
+
+### 3. `HELLO` is no longer the main blocker
+
+Earlier, CN hung on:
+
+```text
 [DEBUG] sending HELLO via RDMA...
-[DEBUG] HELLO send FAILED: rdma completion failed status=12 (transport retry counter exceeded)
-startup error: rdma completion failed status=12 (transport retry counter exceeded)
 ```
+
+That path is now bypassed by configuration:
+
+```text
+[DEBUG] skipping HELLO; using bootstrap metadata directly
+```
+
+So the current failure is after bootstrap and after session setup.
+
+### 4. RPC fallback is really selected
+
+Recent CN log confirms that the client is not taking the one-sided direct read/write path:
+
+```text
+[DEBUG] rdma session modes: control=write_imm data=rpc skip_hello=on
+[DEBUG] using RDMA RPC fallback for READ/WRITE (data_mode=rpc, direct_flag=1)
+```
+
+This is important because it rules out "CN is still accidentally trying direct RDMA read/write" as the main explanation.
+
+### 5. `write_imm` access rights were fixed
+
+The control path originally used `RDMA_WRITE_WITH_IMM`, but the responder-side QP and MRs did not allow remote writes.
+
+That was fixed by:
+
+- enabling `IBV_ACCESS_REMOTE_WRITE` on the guest/shared control buffers
+- enabling `IBV_ACCESS_REMOTE_WRITE` in QP INIT when `write_imm` mode is active
+
+This fixed the immediate QP-to-ERR transition on first RPC.
+
+## Current Failure
+
+Current CN behavior:
+
+```text
+td> read a
+[RDMA-DEBUG] post_recv qpn=96 ...
+[RDMA-DEBUG] post_write_imm op=READ(2) qpn=96 payload_len=0 ctrl_remote=... op_remote=...
+[RDMA-DEBUG] pre-write-imm qp state=RTS ...
+[RDMA-DEBUG] waiting for CQ completion expected=RDMA_WRITE empty_polls=50000000 qpn=96
+...
+```
+
+Current MN behavior at the same time:
+
+```text
+[MN-DEBUG] server thread started, qpn=40 lid=1
+[MN-DEBUG] still polling CQ, no completions yet ...
+```
+
+What that means:
+
+- CN posts `RDMA_WRITE_WITH_IMM`
+- CN does not get a local `RDMA_WRITE` completion
+- MN does not get `RECV_RDMA_WITH_IMM`
+- both QPs are already in `RTS`
+- bootstrap metadata is already exchanged
+
+So the current failure point is:
+
+- the first inbound RDMA packet to guest shared memory never completes
 
 ## Current Interpretation
 
-The primary blocker is now:
+The remaining blocker is below the application protocol layer.
 
-- Guest-side `ibv_reg_mr()` for the shared region fails on the first segment with `Input/output error`.
+The evidence now supports this interpretation:
 
-The CN failure is secondary:
+- TDX guest shared conversion is happening
+- RDMA buffers are shared and MR-registered
+- QP bootstrap is correct enough to reach `RTS`
+- RPC fallback is selected correctly
+- control-path permissions are configured correctly
 
-- TCP bootstrap succeeds.
-- QP bootstrap succeeds.
-- The MN fails to present a usable remote region / QP state for subsequent data-path operation.
-- CN `HELLO` then times out with `transport retry counter exceeded`.
+But:
 
-## Important Observations
+- external CN still cannot complete a remote RDMA write into the TDX guest's shared userspace buffer
 
-- The old immediate guest crash was mitigated enough to let the MN reach the RDMA setup path.
-- The environment is still not providing a working direct user-memory MR path for the converted shared region.
-- The failure happens at the first region segment, not later in the segmented registration loop.
-- The shared-memory conversion prototype in `~/2026/share` was validated for smaller test allocations, but the application path still fails when registering the real RDMA window.
+That is consistent with a guest/driver/runtime limitation such as:
 
-## Most Likely Root Cause
+- inbound DMA into TDX shared-converted userspace pages is not actually functional in this environment
+- the passthrough mlx5 path does not complete RC traffic targeting these guest pages
+- the memory is "shared enough" for conversion/MR registration but not actually usable as an RDMA destination
 
-One of the following is still true:
+## Non-Issues Already Eliminated
 
-- `/dev/tdx_shmem` conversion is sufficient for simple tests but not sufficient for `mlx5` user MR registration on this TDX guest.
-- The guest RDMA driver stack still falls back to a DMA path that cannot handle this converted userspace memory correctly.
-- The converted pages are visible enough to avoid a hard guest crash, but not valid enough for `ibv_reg_mr()` to build an RDMA MR.
+These are no longer the leading suspects:
 
-## Current Blocker Statement
+- wrong `rdma_device` naming
+- TCP bootstrap failure
+- `HELLO` handshake logic
+- missing shared conversion of control buffers
+- missing `REMOTE_WRITE` access on control MRs
+- QP not reaching `RTR/RTS`
+- CN accidentally selecting direct one-sided read/write while `rpc` mode is configured
 
-`dist-tdx` no longer fails at TCP bootstrap or at basic guest region setup, but direct registration of the TDX guest shared slot region still fails at:
+## Practical Conclusion
 
-`ibv_reg_mr(...): Input/output error`
+`dist-tdx` is currently blocked by the guest RDMA data path, not by high-level protocol code.
 
-This is the active blocker preventing end-to-end direct RDMA access to the guest shared memory.
+More specifically:
 
-## Suggested Next Debug Direction
+- outbound setup from the CN is fine
+- inbound RDMA traffic into guest shared userspace memory is not completing
 
-- Capture guest `dmesg` immediately after the `ibv_reg_mr()` failure.
-- Check whether `mlx5`, `ib_core`, `iommu`, `swiotlb`, or TDX-related kernel logs explain the EIO.
-- Verify whether the failing path is the same with a much smaller application-exposed shared region.
-- If direct user MR is still unsupported in this environment, fall back to a smaller explicitly managed RDMA-visible window or revisit a hybrid design.
+Until that environment-level limitation is resolved, end-to-end CRUD over RDMA will remain broken even with RPC fallback.
+
+## Suggested Next Step
+
+The next meaningful test is not another protocol change inside `dist-tdx`.
+
+Instead, validate the environment directly with a minimal verbs test that does only this:
+
+- CN issues `RDMA_WRITE_WITH_IMM` or `SEND`
+- target buffer lives in the TDX guest and is shared-converted the same way `dist-tdx` uses it
+
+If that minimal test also hangs, the blocker is definitively outside `dist-tdx`.
