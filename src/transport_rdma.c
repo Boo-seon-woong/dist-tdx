@@ -683,12 +683,19 @@ static int td_rdma_query_local_conn_info(td_rdma_impl_t *impl, td_rdma_conn_info
 
 static int td_rdma_qp_to_init(td_rdma_impl_t *impl, char *err, size_t err_len) {
     struct ibv_qp_attr attr;
+    int access_flags = 0;
 
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = (uint8_t)impl->port_num;
     attr.pkey_index = 0;
-    attr.qp_access_flags = 0;
+    if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
+        access_flags |= IBV_ACCESS_REMOTE_WRITE;
+    }
+    if (impl->data_mode == TD_RDMA_DATA_DIRECT) {
+        access_flags |= IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    }
+    attr.qp_access_flags = access_flags;
 
     if (ibv_modify_qp(impl->qp, &attr,
             IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
@@ -1045,10 +1052,20 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size
         return -1;
     }
 
-    if (td_rdma_register_shared_buffer_mr(impl, impl->send_msg, sizeof(*impl->send_msg), IBV_ACCESS_LOCAL_WRITE, &impl->send_mr, err, err_len) != 0 ||
-        td_rdma_register_shared_buffer_mr(impl, impl->recv_msg, sizeof(*impl->recv_msg), IBV_ACCESS_LOCAL_WRITE, &impl->recv_mr, err, err_len) != 0 ||
-        td_rdma_register_shared_buffer_mr(impl, impl->op_buf, impl->op_buf_len, IBV_ACCESS_LOCAL_WRITE, &impl->op_mr, err, err_len) != 0) {
-        return -1;
+    {
+        int control_recv_access = IBV_ACCESS_LOCAL_WRITE;
+        int op_buf_access = IBV_ACCESS_LOCAL_WRITE;
+
+        if (impl->control_mode == TD_RDMA_CONTROL_WRITE_IMM) {
+            control_recv_access |= IBV_ACCESS_REMOTE_WRITE;
+            op_buf_access |= IBV_ACCESS_REMOTE_WRITE;
+        }
+
+        if (td_rdma_register_shared_buffer_mr(impl, impl->send_msg, sizeof(*impl->send_msg), IBV_ACCESS_LOCAL_WRITE, &impl->send_mr, err, err_len) != 0 ||
+            td_rdma_register_shared_buffer_mr(impl, impl->recv_msg, sizeof(*impl->recv_msg), control_recv_access, &impl->recv_mr, err, err_len) != 0 ||
+            td_rdma_register_shared_buffer_mr(impl, impl->op_buf, impl->op_buf_len, op_buf_access, &impl->op_mr, err, err_len) != 0) {
+            return -1;
+        }
     }
 
     impl->psn = (uint32_t)((td_now_ns() ^ (uint64_t)getpid()) & 0x00ffffffu);
@@ -1634,7 +1651,6 @@ static int td_rdma_client_read_rpc(td_session_t *session, size_t offset, void *b
             } : NULL,
             err,
             err_len) != 0) {
-        td_format_error(err, err_len, "rdma read rpc failed");
         return -1;
     }
     td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->read_send_ns : NULL);
@@ -1657,7 +1673,6 @@ static int td_rdma_client_read_rpc(td_session_t *session, size_t offset, void *b
             session->transport_profile != NULL ? &session->transport_profile->read_copy_ns : NULL,
             err,
             err_len) != 0) {
-        td_format_error(err, err_len, "rdma read rpc failed");
         return -1;
     }
     if (response.status != 0 || response.length != len) {
@@ -1763,7 +1778,6 @@ static int td_rdma_client_write_rpc(td_session_t *session, size_t offset, const 
             } : NULL,
             err,
             err_len) != 0) {
-        td_format_error(err, err_len, "rdma write rpc failed");
         return -1;
     }
     td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->write_send_ns : NULL);
@@ -1785,7 +1799,6 @@ static int td_rdma_client_write_rpc(td_session_t *session, size_t offset, const 
             NULL,
             err,
             err_len) != 0) {
-        td_format_error(err, err_len, "rdma write rpc failed");
         return -1;
     }
     if (response.status != 0) {
