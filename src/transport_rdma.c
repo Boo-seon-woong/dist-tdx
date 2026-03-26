@@ -88,6 +88,7 @@ typedef struct {
     td_rdma_control_mode_t control_mode;
     td_rdma_data_mode_t data_mode;
     int skip_hello;
+    int control_fd;
     uint64_t remote_ctrl_addr;
     uint32_t remote_ctrl_rkey;
     uint64_t remote_op_addr;
@@ -970,6 +971,9 @@ static void td_rdma_accumulate_server_profile(td_transport_profile_t *profile, t
 }
 
 static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
+    if (impl->control_fd >= 0) {
+        close(impl->control_fd);
+    }
     if (impl->send_mr != NULL) {
         ibv_dereg_mr(impl->send_mr);
     }
@@ -1003,6 +1007,7 @@ static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
 static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size_t op_buf_len, char *err, size_t err_len) {
     struct ibv_qp_init_attr qp_attr;
 
+    impl->control_fd = -1;
     if (td_tdx_runtime_init(&impl->tdx, cfg->mode, cfg->tdx, err, err_len) != 0) {
         return -1;
     }
@@ -1395,6 +1400,34 @@ static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, 
     return td_rdma_send_message_sendrecv(impl, msg, payload, payload_len, copy_ns, post_send_ns, send_wait_ns, wait_profile, err, err_len);
 }
 
+static int td_rdma_tcp_exchange(td_session_t *session, td_rdma_impl_t *impl, const td_wire_msg_t *request, const void *payload, td_wire_msg_t *response, void *response_payload, char *err, size_t err_len) {
+    (void)session;
+
+    if (impl->control_fd < 0) {
+        td_format_error(err, err_len, "rdma tcp control channel is not available");
+        return -1;
+    }
+    if (td_send_all(impl->control_fd, request, sizeof(*request)) != 0) {
+        td_format_error(err, err_len, "rdma tcp control send failed");
+        return -1;
+    }
+    if (payload != NULL && request->length > 0 &&
+        td_send_all(impl->control_fd, payload, (size_t)request->length) != 0) {
+        td_format_error(err, err_len, "rdma tcp control payload send failed");
+        return -1;
+    }
+    if (td_recv_all(impl->control_fd, response, sizeof(*response)) != 0) {
+        td_format_error(err, err_len, "rdma tcp control response receive failed");
+        return -1;
+    }
+    if (response_payload != NULL && response->length > 0 &&
+        td_recv_all(impl->control_fd, response_payload, (size_t)response->length) != 0) {
+        td_format_error(err, err_len, "rdma tcp control payload receive failed");
+        return -1;
+    }
+    return 0;
+}
+
 static int td_rdma_wait_message(td_rdma_impl_t *impl, td_wire_msg_t *response, void *payload, size_t payload_cap, size_t *payload_len_out, uint64_t *wait_ns, td_rdma_wait_profile_t *wait_profile, uint64_t *header_copy_ns, uint64_t *payload_copy_ns, char *err, size_t err_len) {
     struct ibv_wc wc;
     uint64_t start_ns = wait_ns != NULL ? td_now_ns() : 0;
@@ -1519,6 +1552,21 @@ static int td_rdma_client_read_rpc(td_session_t *session, size_t offset, void *b
     request.offset = offset;
     request.length = len;
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
+
+    if (impl->control_fd >= 0) {
+        start_ns = td_rdma_profile_begin(session);
+        if (td_rdma_tcp_exchange(session, impl, &request, NULL, &response, buf, err, err_len) != 0) {
+            return -1;
+        }
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->read_send_ns : NULL);
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->read_wait_ns : NULL);
+        if (response.status != 0 || response.length != len) {
+            td_format_error(err, err_len, "rdma tcp-control read failed");
+            return -1;
+        }
+        td_rdma_accumulate_server_profile(session->transport_profile, TD_WIRE_READ, &response);
+        return 0;
+    }
 
     if (td_rdma_post_recv(impl, err, err_len) != 0) {
         return -1;
@@ -1647,6 +1695,21 @@ static int td_rdma_client_write_rpc(td_session_t *session, size_t offset, const 
     request.length = len;
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
 
+    if (impl->control_fd >= 0) {
+        start_ns = td_rdma_profile_begin(session);
+        if (td_rdma_tcp_exchange(session, impl, &request, buf, &response, NULL, err, err_len) != 0) {
+            return -1;
+        }
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->write_send_ns : NULL);
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->write_wait_ns : NULL);
+        if (response.status != 0) {
+            td_format_error(err, err_len, "rdma tcp-control write failed");
+            return -1;
+        }
+        td_rdma_accumulate_server_profile(session->transport_profile, TD_WIRE_WRITE, &response);
+        return 0;
+    }
+
     if (td_rdma_post_recv(impl, err, err_len) != 0) {
         return -1;
     }
@@ -1711,6 +1774,23 @@ static int td_rdma_client_cas(td_session_t *session, size_t offset, uint64_t com
     request.compare = compare;
     request.swap = swap;
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
+
+    if (impl->control_fd >= 0) {
+        start_ns = td_rdma_profile_begin(session);
+        if (td_rdma_tcp_exchange(session, impl, &request, NULL, &response, NULL, err, err_len) != 0) {
+            td_format_error(err, err_len, "rdma tcp-control cas failed");
+            return -1;
+        }
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->cas_send_ns : NULL);
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->cas_wait_ns : NULL);
+        if (response.status != 0) {
+            td_format_error(err, err_len, "rdma tcp-control cas failed");
+            return -1;
+        }
+        *old_value = response.compare;
+        td_rdma_accumulate_server_profile(session->transport_profile, TD_WIRE_CAS, &response);
+        return 0;
+    }
 
     if (td_rdma_post_recv(impl, err, err_len) != 0) {
         return -1;
@@ -1777,6 +1857,22 @@ static int td_rdma_client_control(td_session_t *session, td_wire_op_t op, char *
     request.magic = TD_WIRE_MAGIC;
     request.op = (uint16_t)op;
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
+
+    if (impl->control_fd >= 0) {
+        start_ns = td_rdma_profile_begin(session);
+        if (td_rdma_tcp_exchange(session, impl, &request, NULL, &response, NULL, err, err_len) != 0) {
+            td_format_error(err, err_len, "rdma tcp-control op %u failed", (unsigned int)op);
+            return -1;
+        }
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->control_send_ns : NULL);
+        td_rdma_profile_end(session, start_ns, session->transport_profile != NULL ? &session->transport_profile->control_wait_ns : NULL);
+        if (response.status != 0) {
+            td_format_error(err, err_len, "rdma tcp-control op %u failed", (unsigned int)op);
+            return -1;
+        }
+        td_rdma_accumulate_server_profile(session->transport_profile, op, &response);
+        return 0;
+    }
 
     if (td_rdma_post_recv(impl, err, err_len) != 0) {
         return -1;
@@ -1933,6 +2029,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         td_format_error(err, err_len, "out of memory");
         return -1;
     }
+    impl->control_fd = -1;
     fprintf(stderr, "[DEBUG] connecting to %s:%d...\n", endpoint->host, endpoint->port);
     fflush(stderr);
     if (cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_TCP || cfg->rdma_bootstrap == TD_RDMA_BOOTSTRAP_VSOCK) {
@@ -1967,9 +2064,8 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         free(impl);
         return -1;
     }
-    if (control_fd >= 0) {
-        close(control_fd);
-    }
+    impl->control_fd = control_fd;
+    control_fd = -1;
 
     fprintf(stderr, "[DEBUG] bootstrap done, local lid=%u qpn=%u psn=%u\n",
             impl->lid, impl->qp->qp_num, impl->psn);
@@ -1994,22 +2090,32 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         hello.magic = TD_WIRE_MAGIC;
         hello.op = TD_WIRE_HELLO;
 
-        fprintf(stderr, "[DEBUG] sending HELLO via RDMA...\n");
+        fprintf(stderr, "[DEBUG] sending HELLO via %s...\n", impl->control_fd >= 0 ? "TCP control" : "RDMA");
         fflush(stderr);
-        if (td_rdma_post_recv(impl, err, err_len) != 0 ||
-            td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0) {
-            fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+        if (impl->control_fd >= 0) {
+            if (td_rdma_tcp_exchange(session, impl, &hello, NULL, &response, NULL, err, err_len) != 0) {
+                fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+                fflush(stderr);
+                td_rdma_destroy_impl(impl);
+                free(impl);
+                return -1;
+            }
+        } else {
+            if (td_rdma_post_recv(impl, err, err_len) != 0 ||
+                td_rdma_send_message(impl, &hello, NULL, 0, NULL, NULL, NULL, NULL, err, err_len) != 0) {
+                fprintf(stderr, "[DEBUG] HELLO send FAILED: %s\n", err);
+                fflush(stderr);
+                td_rdma_destroy_impl(impl);
+                free(impl);
+                return -1;
+            }
+            fprintf(stderr, "[DEBUG] HELLO send completed, waiting for response...\n");
             fflush(stderr);
-            td_rdma_destroy_impl(impl);
-            free(impl);
-            return -1;
-        }
-        fprintf(stderr, "[DEBUG] HELLO send completed, waiting for response...\n");
-        fflush(stderr);
-        if (td_rdma_wait_message(impl, &response, NULL, 0, NULL, NULL, NULL, NULL, NULL, err, err_len) != 0) {
-            td_rdma_destroy_impl(impl);
-            free(impl);
-            return -1;
+            if (td_rdma_wait_message(impl, &response, NULL, 0, NULL, NULL, NULL, NULL, NULL, err, err_len) != 0) {
+                td_rdma_destroy_impl(impl);
+                free(impl);
+                return -1;
+            }
         }
         if (response.status != 0) {
             td_rdma_destroy_impl(impl);
@@ -2037,7 +2143,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         session->read_region = td_rdma_client_read;
         session->write_region = td_rdma_client_write;
     } else {
-        fprintf(stderr, "[DEBUG] using RDMA RPC fallback for READ/WRITE (data_mode=%s, direct_flag=%u)\n",
+        fprintf(stderr, "[DEBUG] using TCP control fallback for READ/WRITE (data_mode=%s, direct_flag=%u)\n",
             td_rdma_data_mode_name(impl->data_mode),
             (response.flags & TD_WIRE_FLAG_DIRECT_REGION) != 0 ? 1u : 0u);
         fflush(stderr);
@@ -2052,55 +2158,28 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
 
 static void *td_rdma_server_conn_main(void *arg) {
     td_rdma_server_conn_t *conn = (td_rdma_server_conn_t *)arg;
-    char err[256];
-    int poll_count = 0;
 
     fprintf(stderr, "[MN-DEBUG] server thread started, qpn=%u lid=%u\n",
             conn->impl.qp->qp_num, conn->impl.lid);
     fflush(stderr);
     td_rdma_debug_dump_qp(&conn->impl, "[RDMA-DEBUG] server thread qp");
 
-    while (!(*conn->stop_flag)) {
-        struct ibv_wc wc;
-        int n = ibv_poll_cq(conn->impl.cq, 1, &wc);
-
-        if (n < 0) {
-            fprintf(stderr, "[MN-DEBUG] poll_cq returned error\n");
-            fflush(stderr);
-            break;
-        }
-        if (n == 0) {
-            poll_count++;
-            if (poll_count % 50000000 == 0) {
-                fprintf(stderr, "[MN-DEBUG] still polling CQ, no completions yet (%d polls)\n", poll_count);
-                fflush(stderr);
-            }
-            sched_yield();
-            continue;
-        }
-        fprintf(stderr, "[MN-DEBUG] got CQ completion: opcode=%d status=%d byte_len=%u\n",
-                wc.opcode, wc.status, wc.byte_len);
-        fflush(stderr);
-        if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "rdma server completion failed status=%d (%s)\n", wc.status, ibv_wc_status_str(wc.status));
-            fflush(stderr);
-            break;
-        }
-        if (wc.opcode == IBV_WC_SEND) {
-            continue;
-        }
-        if (wc.opcode != IBV_WC_RECV && wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
-            continue;
-        }
-
-        {
-            td_wire_msg_t request = *conn->impl.recv_msg;
+    if (conn->impl.control_fd >= 0) {
+        while (!(*conn->stop_flag)) {
+            td_wire_msg_t request;
             td_wire_msg_t response;
-            size_t payload_len = 0;
             const void *response_payload = NULL;
             size_t response_payload_len = 0;
+            size_t payload_len = 0;
             int profile_enabled;
             uint64_t op_start;
+
+            if (td_recv_all(conn->impl.control_fd, &request, sizeof(request)) != 0) {
+                break;
+            }
+            if (request.magic != TD_WIRE_MAGIC) {
+                break;
+            }
 
             memset(&response, 0, sizeof(response));
             response.magic = TD_WIRE_MAGIC;
@@ -2108,33 +2187,6 @@ static void *td_rdma_server_conn_main(void *arg) {
             response.flags = request.flags;
             profile_enabled = (request.flags & TD_WIRE_FLAG_PROFILE) != 0;
             op_start = profile_enabled ? td_now_ns() : 0;
-
-            if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-                payload_len = (size_t)request.length;
-                fprintf(stderr, "[MN-DEBUG] recv RDMA_WRITE_WITH_IMM imm=0x%08x request_len=%zu\n",
-                    ntohl(wc.imm_data),
-                    payload_len);
-                fflush(stderr);
-            } else {
-                if ((size_t)wc.byte_len < sizeof(request)) {
-                    fprintf(stderr, "[MN-DEBUG] recv too short: %u < %zu\n", wc.byte_len, sizeof(request));
-                    fflush(stderr);
-                    response.status = 1;
-                    request.op = 0;
-                } else {
-                    payload_len = (size_t)wc.byte_len - sizeof(request);
-                }
-            }
-            if (request.op != 0 && request.magic != TD_WIRE_MAGIC) {
-                fprintf(stderr, "[MN-DEBUG] magic mismatch: got 0x%08x expected 0x%08x, recv_msg@%p first 32 bytes:",
-                        request.magic, TD_WIRE_MAGIC, (void*)conn->impl.recv_msg);
-                { unsigned char *p = (unsigned char*)conn->impl.recv_msg; int i;
-                  for (i = 0; i < 32; i++) fprintf(stderr, " %02x", p[i]);
-                }
-                fprintf(stderr, "\n");
-                fflush(stderr);
-                break;
-            }
 
             if (request.op == TD_WIRE_HELLO) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
@@ -2149,7 +2201,7 @@ static void *td_rdma_server_conn_main(void *arg) {
                 }
             } else if (request.op == TD_WIRE_READ) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
-                if (request.length > conn->impl.op_buf_len || payload_len != 0 ||
+                if (request.length > conn->impl.op_buf_len ||
                     td_region_read_bytes(conn->region, (size_t)request.offset, conn->impl.op_buf, (size_t)request.length) != 0) {
                     response.status = 1;
                     response.length = 0;
@@ -2162,9 +2214,17 @@ static void *td_rdma_server_conn_main(void *arg) {
                     response.profile_stage1_ns += td_now_ns() - stage_start;
                 }
             } else if (request.op == TD_WIRE_WRITE) {
-                uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
-                if (request.length > conn->impl.op_buf_len || payload_len != (size_t)request.length ||
-                    td_region_write_bytes(conn->region, (size_t)request.offset, conn->impl.op_buf, (size_t)request.length) != 0) {
+                uint64_t stage_start;
+
+                if (request.length > conn->impl.op_buf_len ||
+                    td_recv_all(conn->impl.control_fd, conn->impl.op_buf, (size_t)request.length) != 0) {
+                    response.status = 1;
+                } else {
+                    payload_len = (size_t)request.length;
+                }
+                stage_start = profile_enabled ? td_now_ns() : 0;
+                if (response.status == 0 &&
+                    td_region_write_bytes(conn->region, (size_t)request.offset, conn->impl.op_buf, payload_len) != 0) {
                     response.status = 1;
                 }
                 if (profile_enabled && stage_start != 0) {
@@ -2172,8 +2232,7 @@ static void *td_rdma_server_conn_main(void *arg) {
                 }
             } else if (request.op == TD_WIRE_CAS) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
-                if (payload_len != 0 ||
-                    td_region_cas64(conn->region, (size_t)request.offset, request.compare, request.swap, &response.compare) != 0) {
+                if (td_region_cas64(conn->region, (size_t)request.offset, request.compare, request.swap, &response.compare) != 0) {
                     response.status = 1;
                 }
                 if (profile_enabled && stage_start != 0) {
@@ -2181,22 +2240,15 @@ static void *td_rdma_server_conn_main(void *arg) {
                 }
             } else if (request.op == TD_WIRE_EVICT) {
                 uint64_t stage_start = profile_enabled ? td_now_ns() : 0;
-                if (payload_len != 0) {
-                    response.status = 1;
-                } else {
-                    td_region_evict_if_needed(conn->region, conn->eviction_threshold_pct);
-                }
+                td_region_evict_if_needed(conn->region, conn->eviction_threshold_pct);
                 if (profile_enabled && stage_start != 0) {
                     response.profile_stage1_ns += td_now_ns() - stage_start;
                 }
             } else if (request.op == TD_WIRE_CLOSE) {
-                if (payload_len != 0) {
-                    response.status = 1;
-                }
                 if (profile_enabled && op_start != 0) {
                     response.profile_total_ns = td_now_ns() - op_start;
                 }
-                if (td_rdma_send_message(&conn->impl, &response, NULL, 0, NULL, NULL, NULL, NULL, err, sizeof(err)) != 0) {
+                if (td_send_all(conn->impl.control_fd, &response, sizeof(response)) != 0) {
                     break;
                 }
                 break;
@@ -2207,12 +2259,50 @@ static void *td_rdma_server_conn_main(void *arg) {
             if (profile_enabled && op_start != 0) {
                 response.profile_total_ns = td_now_ns() - op_start;
             }
-            if (td_rdma_send_message(&conn->impl, &response, response_payload, response_payload_len, NULL, NULL, NULL, NULL, err, sizeof(err)) != 0) {
+            if (td_send_all(conn->impl.control_fd, &response, sizeof(response)) != 0) {
                 break;
             }
-            if (td_rdma_post_recv(&conn->impl, err, sizeof(err)) != 0) {
+            if (response_payload != NULL && response_payload_len > 0 &&
+                td_send_all(conn->impl.control_fd, response_payload, response_payload_len) != 0) {
                 break;
             }
+        }
+    } else {
+        int poll_count = 0;
+
+        while (!(*conn->stop_flag)) {
+            struct ibv_wc wc;
+            int n = ibv_poll_cq(conn->impl.cq, 1, &wc);
+
+            if (n < 0) {
+                fprintf(stderr, "[MN-DEBUG] poll_cq returned error\n");
+                fflush(stderr);
+                break;
+            }
+            if (n == 0) {
+                poll_count++;
+                if (poll_count % 50000000 == 0) {
+                    fprintf(stderr, "[MN-DEBUG] still polling CQ, no completions yet (%d polls)\n", poll_count);
+                    fflush(stderr);
+                }
+                sched_yield();
+                continue;
+            }
+            fprintf(stderr, "[MN-DEBUG] got CQ completion: opcode=%d status=%d byte_len=%u\n",
+                    wc.opcode, wc.status, wc.byte_len);
+            fflush(stderr);
+            if (wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "rdma server completion failed status=%d (%s)\n", wc.status, ibv_wc_status_str(wc.status));
+                fflush(stderr);
+                break;
+            }
+            if (wc.opcode == IBV_WC_SEND) {
+                continue;
+            }
+            if (wc.opcode != IBV_WC_RECV && wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
+                continue;
+            }
+            break;
         }
     }
 
@@ -2330,6 +2420,7 @@ static int td_rdma_server_run_oob_file(const td_config_t *cfg, td_local_region_t
                 td_rdma_register_server_region(conn, conn_err, sizeof(conn_err)) == 0 &&
                 td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
                 td_rdma_exchange_server_bootstrap_oob_file(cfg, &request, response_path, &conn->impl, conn_err, sizeof(conn_err)) == 0) {
+                conn->impl.control_fd = -1;
             }
             unlink(claimed_request_path);
             if (conn_err[0] == '\0') {
@@ -2411,14 +2502,17 @@ int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volati
                 conn->stop_flag = stop_flag;
                 if (td_rdma_setup_impl(&conn->impl, cfg, sizeof(td_slot_t), conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_register_server_region(conn, conn_err, sizeof(conn_err)) == 0 &&
-                    td_rdma_post_recv(&conn->impl, conn_err, sizeof(conn_err)) == 0 &&
                     td_rdma_exchange_server_bootstrap(client_fd, conn, conn_err, sizeof(conn_err)) == 0) {
+                    conn->impl.control_fd = client_fd;
+                    client_fd = -1;
                     fprintf(stderr, "[MN-DEBUG] bootstrap OK, local lid=%u qpn=%u psn=%u recv_msg@%p send_msg@%p op_buf@%p\n",
                             conn->impl.lid, conn->impl.qp->qp_num, conn->impl.psn,
                             (void*)conn->impl.recv_msg, (void*)conn->impl.send_msg, (void*)conn->impl.op_buf);
                     fflush(stderr);
                 }
-                close(client_fd);
+                if (client_fd >= 0) {
+                    close(client_fd);
+                }
                 if (conn_err[0] == '\0') {
                     if (pthread_create(&thread, NULL, td_rdma_server_conn_main, conn) == 0) {
                         pthread_detach(thread);

@@ -96,6 +96,7 @@ Meaning:
 - control operations use `SEND/RECV`
 - `READ/WRITE` are issued as RPCs instead of one-sided direct region access
 - CN skips `HELLO` and uses bootstrap metadata directly
+- when `rpc` fallback is selected, the request/response control plane runs on the bootstrap TCP/vsock channel rather than RDMA messaging
 
 ## Config Files
 
