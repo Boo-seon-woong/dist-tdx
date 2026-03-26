@@ -86,6 +86,7 @@ typedef struct {
     int has_gid;
     uint32_t psn;
     td_rdma_control_mode_t control_mode;
+    td_rdma_data_mode_t data_mode;
     int skip_hello;
     uint64_t remote_ctrl_addr;
     uint32_t remote_ctrl_rkey;
@@ -337,6 +338,28 @@ static const char *td_rdma_wire_op_name(uint16_t op) {
             return "CLOSE";
         default:
             return "UNKNOWN";
+    }
+}
+
+static const char *td_rdma_control_mode_name(td_rdma_control_mode_t mode) {
+    switch (mode) {
+        case TD_RDMA_CONTROL_SEND:
+            return "send";
+        case TD_RDMA_CONTROL_WRITE_IMM:
+            return "write_imm";
+        default:
+            return "unknown";
+    }
+}
+
+static const char *td_rdma_data_mode_name(td_rdma_data_mode_t mode) {
+    switch (mode) {
+        case TD_RDMA_DATA_DIRECT:
+            return "direct";
+        case TD_RDMA_DATA_RPC:
+            return "rpc";
+        default:
+            return "unknown";
     }
 }
 
@@ -1007,7 +1030,15 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, const td_config_t *cfg, size
 
     impl->op_buf_len = op_buf_len;
     impl->control_mode = cfg->rdma_control_mode;
+    impl->data_mode = cfg->rdma_data_mode;
     impl->skip_hello = cfg->rdma_skip_hello;
+    fprintf(stderr,
+        "[RDMA-DEBUG] impl modes control=%s data=%s skip_hello=%s op_buf_len=%zu\n",
+        td_rdma_control_mode_name(impl->control_mode),
+        td_rdma_data_mode_name(impl->data_mode),
+        impl->skip_hello ? "on" : "off",
+        impl->op_buf_len);
+    fflush(stderr);
     if (td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->send_msg), (void **)&impl->send_msg, err, err_len) != 0 ||
         td_tdx_map_shared_memory(&impl->tdx, sizeof(*impl->recv_msg), (void **)&impl->recv_msg, err, err_len) != 0 ||
         td_tdx_map_shared_memory(&impl->tdx, impl->op_buf_len, (void **)&impl->op_buf, err, err_len) != 0) {
@@ -2042,6 +2073,11 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
             impl->lid, impl->qp->qp_num, impl->psn);
     fflush(stderr);
     td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] client post-bootstrap qp");
+    fprintf(stderr, "[DEBUG] rdma session modes: control=%s data=%s skip_hello=%s\n",
+        td_rdma_control_mode_name(impl->control_mode),
+        td_rdma_data_mode_name(impl->data_mode),
+        impl->skip_hello ? "on" : "off");
+    fflush(stderr);
 
     if (cfg->rdma_skip_hello) {
         fprintf(stderr, "[DEBUG] skipping HELLO; using bootstrap metadata directly\n");
@@ -2088,11 +2124,20 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     session->header = response.header;
     session->region_size = (size_t)response.header.region_size;
     session->impl = impl;
-    if ((response.flags & TD_WIRE_FLAG_DIRECT_REGION) != 0 && response.remote_addr != 0 && response.rkey != 0) {
+    if (impl->data_mode == TD_RDMA_DATA_DIRECT &&
+        (response.flags & TD_WIRE_FLAG_DIRECT_REGION) != 0 &&
+        response.remote_addr != 0 &&
+        response.rkey != 0) {
+        fprintf(stderr, "[DEBUG] using direct RDMA region path for READ/WRITE remote_addr=0x%llx rkey=%u\n",
+            (unsigned long long)response.remote_addr,
+            response.rkey);
+        fflush(stderr);
         session->read_region = td_rdma_client_read;
         session->write_region = td_rdma_client_write;
     } else {
-        fprintf(stderr, "[DEBUG] server does not expose direct region MR; using SEND/RECV fallback for READ/WRITE\n");
+        fprintf(stderr, "[DEBUG] using RDMA RPC fallback for READ/WRITE (data_mode=%s, direct_flag=%u)\n",
+            td_rdma_data_mode_name(impl->data_mode),
+            (response.flags & TD_WIRE_FLAG_DIRECT_REGION) != 0 ? 1u : 0u);
         fflush(stderr);
         session->read_region = td_rdma_client_read_rpc;
         session->write_region = td_rdma_client_write_rpc;

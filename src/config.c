@@ -60,6 +60,18 @@ static int td_parse_rdma_control_mode(const char *value, td_rdma_control_mode_t 
     return -1;
 }
 
+static int td_parse_rdma_data_mode(const char *value, td_rdma_data_mode_t *out) {
+    if (strcmp(value, "direct") == 0) {
+        *out = TD_RDMA_DATA_DIRECT;
+        return 0;
+    }
+    if (strcmp(value, "rpc") == 0 || strcmp(value, "sendrecv") == 0) {
+        *out = TD_RDMA_DATA_RPC;
+        return 0;
+    }
+    return -1;
+}
+
 static int td_parse_toggle(const char *value, int *out) {
     if (strcmp(value, "on") == 0) {
         *out = 1;
@@ -283,6 +295,7 @@ void td_config_init_defaults(td_config_t *cfg) {
     cfg->mn_memory_size = 64ULL * 1024ULL * 1024ULL;
     cfg->rdma_bootstrap = TD_RDMA_BOOTSTRAP_OOB_FILE;
     cfg->rdma_control_mode = TD_RDMA_CONTROL_WRITE_IMM;
+    cfg->rdma_data_mode = TD_RDMA_DATA_RPC;
     cfg->rdma_skip_hello = 0;
     cfg->rdma_gid_index = 0;
     cfg->rdma_port_num = 1;
@@ -383,6 +396,12 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
         } else if (strcmp(key, "rdma_control_mode") == 0) {
             if (td_parse_rdma_control_mode(value, &cfg->rdma_control_mode) != 0) {
                 td_format_error(err, err_len, "invalid rdma_control_mode at line %zu", line_no);
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(key, "rdma_data_mode") == 0) {
+            if (td_parse_rdma_data_mode(value, &cfg->rdma_data_mode) != 0) {
+                td_format_error(err, err_len, "invalid rdma_data_mode at line %zu", line_no);
                 fclose(fp);
                 return -1;
             }
