@@ -188,30 +188,21 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     }
 
     if (cfg->transport == TD_TRANSPORT_RDMA) {
-        /*
-         * In the current TDX guest deployment, direct MR registration of the
-         * full slot region falls back to SWIOTLB bounce buffering and exhausts
-         * the guest bounce pool. Keep the large region private and let only the
-         * small SEND/RECV control buffers use the shared-conversion path.
-         */
-        if (cfg->tdx == TD_TDX_ON) {
-            mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            region->shared.anonymous_mapping = 1;
-            region->shared.shared_converted = 0;
-            snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-private]");
-        } else {
-            mapped = NULL;
-            if (td_tdx_map_shared_memory(&region->shared.tdx, bytes, &mapped, err, err_len) != 0) {
-                return -1;
-            }
-            if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
-                td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
-                return -1;
-            }
-            region->shared.anonymous_mapping = 1;
-            region->shared.shared_converted = 1;
-            snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
+        mapped = NULL;
+        if (td_tdx_map_shared_memory(&region->shared.tdx, bytes, &mapped, err, err_len) != 0) {
+            return -1;
         }
+        fprintf(stderr, "[MN-DEBUG] shared region mapped base=%p bytes=%zu\n", mapped, bytes);
+        fflush(stderr);
+        if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
+            td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
+            return -1;
+        }
+        fprintf(stderr, "[MN-DEBUG] shared region converted base=%p bytes=%zu\n", mapped, bytes);
+        fflush(stderr);
+        region->shared.anonymous_mapping = 1;
+        region->shared.shared_converted = 1;
+        snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
     } else {
         region->shared.fd = open(cfg->memory_file, O_RDWR | O_CREAT, 0600);
         if (region->shared.fd < 0) {

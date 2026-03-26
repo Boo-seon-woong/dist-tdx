@@ -301,6 +301,134 @@ static int td_rdma_gid_is_zero(const union ibv_gid *gid) {
     return 1;
 }
 
+static const char *td_rdma_wire_op_name(uint16_t op) {
+    switch (op) {
+        case TD_WIRE_HELLO:
+            return "HELLO";
+        case TD_WIRE_READ:
+            return "READ";
+        case TD_WIRE_WRITE:
+            return "WRITE";
+        case TD_WIRE_CAS:
+            return "CAS";
+        case TD_WIRE_EVICT:
+            return "EVICT";
+        case TD_WIRE_ACK:
+            return "ACK";
+        case TD_WIRE_CLOSE:
+            return "CLOSE";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *td_rdma_qp_state_name(enum ibv_qp_state state) {
+    switch (state) {
+        case IBV_QPS_RESET:
+            return "RESET";
+        case IBV_QPS_INIT:
+            return "INIT";
+        case IBV_QPS_RTR:
+            return "RTR";
+        case IBV_QPS_RTS:
+            return "RTS";
+        case IBV_QPS_SQD:
+            return "SQD";
+        case IBV_QPS_SQE:
+            return "SQE";
+        case IBV_QPS_ERR:
+            return "ERR";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *td_rdma_wc_opcode_name(enum ibv_wc_opcode opcode) {
+    switch (opcode) {
+        case IBV_WC_SEND:
+            return "SEND";
+        case IBV_WC_RECV:
+            return "RECV";
+        case IBV_WC_RDMA_WRITE:
+            return "RDMA_WRITE";
+        case IBV_WC_RDMA_READ:
+            return "RDMA_READ";
+        case IBV_WC_COMP_SWAP:
+            return "COMP_SWAP";
+        case IBV_WC_FETCH_ADD:
+            return "FETCH_ADD";
+        default:
+            return "OTHER";
+    }
+}
+
+static void td_rdma_debug_dump_conn_info(const char *prefix, const td_rdma_conn_info_t *info) {
+    if (info == NULL) {
+        return;
+    }
+    fprintf(stderr,
+        "%s lid=%u mtu=%u has_gid=%u qpn=%u psn=%u gid=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+        prefix,
+        info->lid,
+        info->mtu,
+        info->has_gid,
+        info->qp_num,
+        info->psn,
+        info->gid[0], info->gid[1], info->gid[2], info->gid[3],
+        info->gid[4], info->gid[5], info->gid[6], info->gid[7],
+        info->gid[8], info->gid[9], info->gid[10], info->gid[11],
+        info->gid[12], info->gid[13], info->gid[14], info->gid[15]);
+    fflush(stderr);
+}
+
+static void td_rdma_debug_dump_qp(td_rdma_impl_t *impl, const char *prefix) {
+    struct ibv_qp_attr attr;
+    struct ibv_qp_init_attr init_attr;
+
+    memset(&attr, 0, sizeof(attr));
+    memset(&init_attr, 0, sizeof(init_attr));
+    if (impl == NULL || impl->qp == NULL) {
+        fprintf(stderr, "%s qp unavailable\n", prefix);
+        fflush(stderr);
+        return;
+    }
+    if (ibv_query_qp(impl->qp,
+            &attr,
+            IBV_QP_STATE |
+            IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN |
+            IBV_QP_SQ_PSN |
+            IBV_QP_TIMEOUT |
+            IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY |
+            IBV_QP_MAX_QP_RD_ATOMIC |
+            IBV_QP_MAX_DEST_RD_ATOMIC |
+            IBV_QP_AV,
+            &init_attr) != 0) {
+        fprintf(stderr, "%s ibv_query_qp failed: %s\n", prefix, strerror(errno));
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr,
+        "%s state=%s path_mtu=%d dest_qpn=%u rq_psn=%u sq_psn=%u timeout=%u retry=%u rnr_retry=%u max_rd_atomic=%u max_dest_rd_atomic=%u dlid=%u port=%u is_global=%u\n",
+        prefix,
+        td_rdma_qp_state_name(attr.qp_state),
+        attr.path_mtu,
+        attr.dest_qp_num,
+        attr.rq_psn,
+        attr.sq_psn,
+        attr.timeout,
+        attr.retry_cnt,
+        attr.rnr_retry,
+        attr.max_rd_atomic,
+        attr.max_dest_rd_atomic,
+        attr.ah_attr.dlid,
+        attr.ah_attr.port_num,
+        attr.ah_attr.is_global);
+    fflush(stderr);
+}
+
 static int td_rdma_read_int_file(const char *path, int *value) {
     FILE *fp;
     char line[64];
@@ -505,6 +633,7 @@ static int td_rdma_qp_to_init(td_rdma_impl_t *impl, char *err, size_t err_len) {
         td_format_error(err, err_len, "ibv_modify_qp INIT failed");
         return -1;
     }
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] qp->INIT");
     return 0;
 }
 
@@ -548,6 +677,8 @@ static int td_rdma_qp_to_rtr(td_rdma_impl_t *impl, const td_rdma_conn_info_t *re
         td_format_error(err, err_len, "ibv_modify_qp RTR failed");
         return -1;
     }
+    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] qp->RTR remote", remote);
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] qp->RTR local");
     return 0;
 }
 
@@ -572,6 +703,7 @@ static int td_rdma_qp_to_rts(td_rdma_impl_t *impl, char *err, size_t err_len) {
         td_format_error(err, err_len, "ibv_modify_qp RTS failed");
         return -1;
     }
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] qp->RTS");
     return 0;
 }
 
@@ -596,11 +728,21 @@ static int td_rdma_post_recv(td_rdma_impl_t *impl, char *err, size_t err_len) {
         td_format_error(err, err_len, "rdma post recv failed");
         return -1;
     }
+    fprintf(stderr,
+        "[RDMA-DEBUG] post_recv qpn=%u recv_msg=%p recv_lkey=%u op_buf=%p op_lkey=%u op_len=%zu\n",
+        impl->qp->qp_num,
+        (void *)impl->recv_msg,
+        impl->recv_mr != NULL ? impl->recv_mr->lkey : 0,
+        (void *)impl->op_buf,
+        impl->op_mr != NULL ? impl->op_mr->lkey : 0,
+        impl->op_buf_len);
+    fflush(stderr);
     return 0;
 }
 
 static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td_rdma_wait_profile_t *profile, struct ibv_wc *out_wc, char *err, size_t err_len) {
     struct ibv_wc wc;
+    unsigned long long empty_polls = 0;
 
     for (;;) {
         uint64_t poll_start_ns = profile != NULL && profile->poll_cq_ns != NULL ? td_now_ns() : 0;
@@ -616,6 +758,15 @@ static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td
         if (n == 0) {
             uint64_t backoff_start_ns = profile != NULL && profile->backoff_ns != NULL ? td_now_ns() : 0;
 
+            ++empty_polls;
+            if ((empty_polls % 50000000ULL) == 0) {
+                fprintf(stderr,
+                    "[RDMA-DEBUG] waiting for CQ completion expected=%s empty_polls=%llu qpn=%u\n",
+                    expected == (enum ibv_wc_opcode)-1 ? "ANY" : td_rdma_wc_opcode_name(expected),
+                    empty_polls,
+                    impl->qp != NULL ? impl->qp->qp_num : 0);
+                td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] cq-wait qp");
+            }
             if (profile != NULL && profile->empty_polls != NULL) {
                 ++(*profile->empty_polls);
             }
@@ -632,6 +783,15 @@ static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td
             td_format_error(err, err_len, "rdma completion failed status=%d (%s)", wc.status, ibv_wc_status_str(wc.status));
             return -1;
         }
+        fprintf(stderr,
+            "[RDMA-DEBUG] CQ completion opcode=%s(%d) status=%d byte_len=%u wr_id=%llu qpn=%u\n",
+            td_rdma_wc_opcode_name(wc.opcode),
+            wc.opcode,
+            wc.status,
+            wc.byte_len,
+            (unsigned long long)wc.wr_id,
+            impl->qp != NULL ? impl->qp->qp_num : 0);
+        fflush(stderr);
         if (expected == (enum ibv_wc_opcode)-1 || wc.opcode == expected) {
             if (out_wc != NULL) {
                 *out_wc = wc;
@@ -644,6 +804,8 @@ static int td_rdma_poll_wc(td_rdma_impl_t *impl, enum ibv_wc_opcode expected, td
 static int td_rdma_register_shared_buffer_mr(td_rdma_impl_t *impl, void *base, size_t bytes, int access, struct ibv_mr **out_mr, char *err, size_t err_len) {
     struct ibv_mr *mr;
 
+    fprintf(stderr, "[RDMA-DEBUG] converting shared buffer base=%p bytes=%zu access=0x%x\n", base, bytes, access);
+    fflush(stderr);
     if (td_tdx_accept_shared_memory(&impl->tdx, base, bytes, err, err_len) != 0) {
         return -1;
     }
@@ -653,21 +815,14 @@ static int td_rdma_register_shared_buffer_mr(td_rdma_impl_t *impl, void *base, s
         td_format_error(err, err_len, "rdma mr registration failed");
         return -1;
     }
+    fprintf(stderr, "[RDMA-DEBUG] shared buffer MR registered base=%p bytes=%zu lkey=%u rkey=%u\n",
+        base, bytes, mr->lkey, mr->rkey);
+    fflush(stderr);
     *out_mr = mr;
     return 0;
 }
 
 static int td_rdma_register_server_region(td_rdma_server_conn_t *conn, char *err, size_t err_len) {
-    if (conn->impl.tdx.enabled == TD_TDX_ON) {
-        fprintf(stderr,
-            "[MN-INFO] TDX guest keeps the slot region private; using SEND/RECV path for READ/WRITE to avoid SWIOTLB exhaustion\n");
-        fflush(stderr);
-        if (err != NULL && err_len > 0) {
-            err[0] = '\0';
-        }
-        return 0;
-    }
-
     fprintf(stderr, "[MN-DEBUG] registering shared region MR base=%p bytes=%zu\n",
         td_region_shared_base(conn->region),
         td_region_shared_bytes(conn->region));
@@ -982,6 +1137,7 @@ static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_query_local_conn_info(impl, &local_msg.conn, err, err_len) != 0) {
         return -1;
     }
+    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap client local", &local_msg.conn);
 
     if (td_send_all(fd, &local_msg, sizeof(local_msg)) != 0 ||
         td_recv_all(fd, &remote_msg, sizeof(remote_msg)) != 0) {
@@ -991,6 +1147,7 @@ static int td_rdma_exchange_client_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_validate_bootstrap(&remote_msg, err, err_len) != 0) {
         return -1;
     }
+    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap client remote", &remote_msg.conn);
     if (td_rdma_qp_to_rtr(impl, &remote_msg.conn, err, err_len) != 0 ||
         td_rdma_qp_to_rts(impl, err, err_len) != 0) {
         return -1;
@@ -1016,6 +1173,8 @@ static int td_rdma_exchange_server_bootstrap(int fd, td_rdma_impl_t *impl, char 
     if (td_rdma_query_local_conn_info(impl, &local_msg.conn, err, err_len) != 0) {
         return -1;
     }
+    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap server remote", &remote_msg.conn);
+    td_rdma_debug_dump_conn_info("[RDMA-DEBUG] bootstrap server local", &local_msg.conn);
     if (td_rdma_qp_to_rtr(impl, &remote_msg.conn, err, err_len) != 0 ||
         td_rdma_qp_to_rts(impl, err, err_len) != 0) {
         return -1;
@@ -1063,6 +1222,21 @@ static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, 
     wr.num_sge = payload_len > 0 ? 2 : 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
+    fprintf(stderr,
+        "[RDMA-DEBUG] post_send op=%s(%u) qpn=%u num_sge=%d header_len=%zu payload_len=%zu send_msg=%p op_buf=%p remote_addr=0x%llx rkey=%u flags=0x%x\n",
+        td_rdma_wire_op_name(msg->op),
+        (unsigned int)msg->op,
+        impl->qp != NULL ? impl->qp->qp_num : 0,
+        wr.num_sge,
+        sizeof(*impl->send_msg),
+        payload_len,
+        (void *)impl->send_msg,
+        (void *)impl->op_buf,
+        (unsigned long long)msg->remote_addr,
+        msg->rkey,
+        msg->flags);
+    fflush(stderr);
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] pre-send qp");
 
     start_ns = post_send_ns != NULL ? td_now_ns() : 0;
     if (ibv_post_send(impl->qp, &wr, &bad_wr) != 0) {
@@ -1077,6 +1251,10 @@ static int td_rdma_send_message(td_rdma_impl_t *impl, const td_wire_msg_t *msg, 
     if (td_rdma_poll_wc(impl, IBV_WC_SEND, wait_profile, NULL, err, err_len) != 0) {
         return -1;
     }
+    fprintf(stderr, "[RDMA-DEBUG] send completion op=%s qpn=%u\n",
+        td_rdma_wire_op_name(msg->op),
+        impl->qp != NULL ? impl->qp->qp_num : 0);
+    fflush(stderr);
     if (send_wait_ns != NULL && start_ns != 0) {
         *send_wait_ns += td_now_ns() - start_ns;
     }
@@ -1660,6 +1838,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
     fprintf(stderr, "[DEBUG] bootstrap done, local lid=%u qpn=%u psn=%u\n",
             impl->lid, impl->qp->qp_num, impl->psn);
     fflush(stderr);
+    td_rdma_debug_dump_qp(impl, "[RDMA-DEBUG] client post-bootstrap qp");
 
     memset(&hello, 0, sizeof(hello));
     hello.magic = TD_WIRE_MAGIC;
@@ -1719,6 +1898,7 @@ static void *td_rdma_server_conn_main(void *arg) {
     fprintf(stderr, "[MN-DEBUG] server thread started, qpn=%u lid=%u\n",
             conn->impl.qp->qp_num, conn->impl.lid);
     fflush(stderr);
+    td_rdma_debug_dump_qp(&conn->impl, "[RDMA-DEBUG] server thread qp");
 
     while (!(*conn->stop_flag)) {
         struct ibv_wc wc;
