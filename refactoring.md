@@ -48,8 +48,8 @@ Control/bootstrap plane:
 RDMA data plane:
 
 - manual verbs RC QP setup
-- RC `SEND/RECV` RPC carrying a wire header and an optional slot-sized payload
-- MN executes read/write/delete/update against the shared slot region on behalf of the CN
+- direct `RDMA_READ` / `RDMA_WRITE` against the MN shared slot region
+- RC `SEND/RECV` control messages for `HELLO`, `CAS`, eviction, and shutdown
 
 2.2 Why this change is required
 
@@ -218,6 +218,9 @@ Reason:
 Therefore the implementation contract is:
 
 - userspace can probe TDX capabilities with a real `tdcall` backend
+- userspace obtains NIC-visible mappings from `td_tdx_map_shared_memory()`
+- the actual private/shared transition used for RDMA registration is driven through the guest's validated external converter device such as `/dev/tdx_shmem`
+- the shared slot region may be exposed as a remote MR only after that conversion succeeds
 - userspace allocators must keep RDMA-visible buffers on the TDX-aware allocation path
 - actual DMA-shareable behavior for MR registration is delegated to the guest-kernel pinning and DMA-mapping path
 
@@ -267,8 +270,8 @@ Operations remain explicit RPCs:
 - `EVICT`
 - `CLOSE`
 
-These all use SEND/RECV on the already-established RC QP.
-The shared slot region is no longer exported as a remote one-sided MR.
+These control operations use SEND/RECV on the already-established RC QP.
+The shared slot region is exported as a remote one-sided MR only after the guest-side shared-memory conversion succeeds.
 
 6. Current Repository State
 
@@ -279,10 +282,12 @@ Implemented:
 - shared slot header/body separation
 - RDMA-visible local buffers moved onto the shared allocator path
 - TDX shared allocator switched from private anonymous mappings to shared-anonymous shmem mappings for NIC-visible buffers
+- external `/dev/tdx_shmem` conversion path wired into shared-memory accept/release
 - region header slimmed to remote-visible layout only
 - manual verbs RC setup
-- RDMA SEND/RECV RPC transport for `READ/WRITE/CAS/EVICT/CLOSE`
-- removal of direct remote exposure of the full shared slot region
+- direct RDMA `READ/WRITE` transport for the shared slot region
+- SEND/RECV control transport for `HELLO/CAS/EVICT/CLOSE`
+- direct remote exposure of the shared slot region only
 - support for resolving `rdma_device` from either verbs device names or IB netdev aliases
 - `rdma_port_num` config
 - file-based OOB bootstrap using a shared rendezvous directory
@@ -357,14 +362,14 @@ Symptom:
 
 Root cause:
 
-- the transport still assumes the full shared slot region must be remotely exposed as a one-sided MR
-- the TDX guest deployment may accept small control/payload MRs while rejecting large user-memory MR registration
+- the guest-side shared-memory conversion path is still missing or incomplete for the full slot region MR
+- the TDX guest deployment may still reject the region registration if pages stay private
 
 Fix:
 
-- stop exporting the full shared slot region as a remote MR
-- use SEND/RECV RPC with slot-sized staging buffers
-- keep the 16GB logical shared store, but let the MN CPU execute reads and writes into that store
+- validate `/dev/tdx_shmem` conversion for the exact region that will be registered
+- ensure the shared slot region, not private metadata, is the only memory exported as the remote MR
+- keep control operations on SEND/RECV and use one-sided RDMA only for the shared slot region
 
 7.6 Wrong environment assumption
 
@@ -413,5 +418,5 @@ Phase 4
 - The RDMA data plane must work without IPoIB
 - QP setup still needs an OOB exchange path
 - In the current deployment, TCP bootstrap via the `run_td` host is the practical default and file OOB remains optional
-- The current stable TDX-friendly RDMA model is RC SEND/RECV RPC, not one-sided remote exposure of the full slot region
+- The current stable TDX-friendly RDMA model is one-sided RDMA for the shared slot region plus SEND/RECV control messages
 - The core problem remains memory-model correctness inside TDX

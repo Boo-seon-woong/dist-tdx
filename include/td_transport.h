@@ -26,6 +26,8 @@ typedef struct {
     uint64_t length;
     uint64_t compare;
     uint64_t swap;
+    uint64_t remote_addr;
+    uint32_t rkey;
     uint32_t flags;
     uint32_t reserved;
     td_region_header_t header;
@@ -124,6 +126,8 @@ typedef void (*td_close_fn)(struct td_session *session);
 typedef struct td_session {
     td_transport_t transport;
     td_endpoint_t endpoint;
+    uint64_t remote_addr;
+    uint32_t rkey;
     td_region_header_t header;
     size_t region_size;
     void *impl;

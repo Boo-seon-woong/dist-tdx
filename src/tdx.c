@@ -1,11 +1,27 @@
 #include "td_tdx.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+typedef struct td_tdx_shmem_req {
+    void *addr;
+    size_t size;
+} td_tdx_shmem_req_t;
+
+enum {
+    TD_TDX_SHMEM_IOCTL_CONVERT = _IOW('t', 1, td_tdx_shmem_req_t),
+    TD_TDX_SHMEM_IOCTL_REVERT = _IOW('t', 2, td_tdx_shmem_req_t),
+};
+
+static const char td_tdx_shmem_device[] = "/dev/tdx_shmem";
 
 typedef struct {
     uint64_t rcx;
@@ -126,6 +142,41 @@ static int td_tdx_call_with_retry(td_tdx_runtime_t *runtime, td_tdcall_leaf_t le
     }
 }
 
+static int td_tdx_shared_ioctl(td_tdx_runtime_t *runtime, unsigned long request, void *base, size_t bytes, char *err, size_t err_len) {
+    td_tdx_shmem_req_t shm_req;
+    int fd;
+    int rc;
+    int saved_errno;
+
+    if (runtime == NULL || runtime->enabled != TD_TDX_ON) {
+        return 0;
+    }
+    if (base == NULL || bytes == 0) {
+        return 0;
+    }
+
+    fd = open(td_tdx_shmem_device, O_RDWR);
+    if (fd < 0) {
+        td_format_error(err, err_len, "cannot open %s: %s", td_tdx_shmem_device, strerror(errno));
+        return -1;
+    }
+
+    shm_req.addr = base;
+    shm_req.size = bytes;
+    rc = ioctl(fd, request, &shm_req);
+    saved_errno = errno;
+    close(fd);
+    if (rc != 0) {
+        td_format_error(err, err_len, "ioctl %s failed for %p+%zu: %s",
+            request == TD_TDX_SHMEM_IOCTL_CONVERT ? "CONVERT" : "REVERT",
+            base,
+            bytes,
+            strerror(saved_errno));
+        return -1;
+    }
+    return 0;
+}
+
 #ifdef TD_TDX_REAL_TDCALL
 static int td_tdx_probe_runtime_info(td_tdx_runtime_t *runtime, char *err, size_t err_len) {
     td_tdcall_args_t args;
@@ -191,11 +242,8 @@ int td_tdx_map_shared_memory(td_tdx_runtime_t *runtime, size_t bytes, void **out
         return -1;
     }
 
-    /*
-     * Keep NIC-visible allocations on a shmem-backed mapping so the RDMA path
-     * does not start from a private COW anonymous VMA. The guest kernel still
-     * owns the actual TDX private/shared transition for DMA registration.
-     */
+    /* RDMA-visible allocations start from a shared-anonymous VMA and are later
+     * converted through the guest's shared-memory conversion device. */
     mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (mapped == MAP_FAILED) {
         td_format_error(err, err_len, "shared memory mmap failed");
@@ -217,28 +265,11 @@ void td_tdx_unmap_shared_memory(td_tdx_runtime_t *runtime, void *base, size_t by
 }
 
 int td_tdx_accept_shared_memory(td_tdx_runtime_t *runtime, void *base, size_t bytes, char *err, size_t err_len) {
-    /*
-     * Raw userspace TDCALL is not sufficient to complete a safe private/shared
-     * transition because Linux also has to update the guest page tables around
-     * the conversion. Leave the transition to the guest-kernel DMA path.
-     */
-    (void)runtime;
-    (void)base;
-    (void)bytes;
-    (void)err;
-    (void)err_len;
-
-    return 0;
+    return td_tdx_shared_ioctl(runtime, TD_TDX_SHMEM_IOCTL_CONVERT, base, bytes, err, err_len);
 }
 
 int td_tdx_release_shared_memory(td_tdx_runtime_t *runtime, void *base, size_t bytes, char *err, size_t err_len) {
-    (void)runtime;
-    (void)base;
-    (void)bytes;
-    (void)err;
-    (void)err_len;
-
-    return 0;
+    return td_tdx_shared_ioctl(runtime, TD_TDX_SHMEM_IOCTL_REVERT, base, bytes, err, err_len);
 }
 
 const char *td_tdx_runtime_name(const td_tdx_runtime_t *runtime) {

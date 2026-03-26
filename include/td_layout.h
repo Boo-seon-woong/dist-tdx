@@ -45,6 +45,7 @@ typedef struct {
     size_t mapped_bytes;
     int fd;
     int anonymous_mapping;
+    int shared_converted;
     char backing_path[TD_PATH_BYTES];
     td_tdx_runtime_t tdx;
 } td_shared_region_t;

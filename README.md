@@ -8,14 +8,15 @@ The main problem is not "how to make RDMA use IP" but "how to keep RDMA on the I
 
 - MN runs inside an Intel TDX guest.
 - CN remains outside the TDX trust boundary.
-- RDMA registers only small shared-visible local buffers; the MN CPU copies between those buffers and the shared slot region.
+- RDMA directly registers the MN shared slot region as a remote-visible MR, while control messages still use small shared-visible local buffers.
 - MN metadata, eviction state, and other control-plane state stay private.
 
 ## RDMA connection model
 
 RDMA data path no longer depends on IPoIB and does not require `rdma_cm`.
 
-- Data plane: manual verbs RC QP setup plus RC `SEND/RECV` RPC carrying a wire header and an optional slot-sized payload.
+- Data plane: manual verbs RC QP setup plus direct `RDMA_READ`/`RDMA_WRITE` against the MN shared slot region.
+- Control path: RC `SEND/RECV` messages for `HELLO`, `CAS`, eviction, and shutdown.
 - Preferred bootstrap plane for the current `run_td` host/guest deployment: TCP bootstrap over QEMU user-net host forwarding.
 - Optional shared-filesystem bootstrap plane: file-based OOB rendezvous through a directory that is truly shared between CN and MN.
 - Optional bootstrap plane: `vsock`, when the host can reach the guest CID in that QEMU/TDX environment.
@@ -76,14 +77,12 @@ For `transport: rdma` with `rdma_bootstrap: vsock`:
 Userspace raw `TDCALL` is not treated as the mechanism that makes RDMA buffers safe in Linux guests.
 
 - The code can probe TDX with a real `tdcall` backend when built with `TDX_REAL_TDCALL=1`.
-- Safe private/shared handling for DMA registration is left to the guest-kernel DMA/pinning path.
-- `td_tdx_map_shared_memory()` therefore represents the allocator contract for NIC-visible memory, not a promise that userspace completed a raw page conversion by itself.
-- The allocator now uses shared-anonymous shmem mappings instead of private COW anonymous mappings for RDMA-visible buffers.
-- The current RDMA transport no longer registers the large shared slot region as a remote MR.
-- RDMA-visible MRs are limited to small control/payload buffers, and the MN CPU executes read/write/delete/update against the shared region on behalf of the CN.
-- `rdma_region_segment_bytes` is retained only for backward config compatibility and is ignored by the current SEND/RECV RPC transport.
-- Current evidence from the TDX guest logs shows `mlx5` still using SWIOTLB bounce buffers for large user-memory registration paths. The refactored RDMA transport avoids that path by removing direct remote exposure of the full shared slot region.
-- If the deployment direction is "fix the environment, not the data model", the guest kernel/RDMA stack must provide a real direct user-MR path under TDX, or expose a supported `dma-buf` MR path such as `ibv_reg_dmabuf_mr()` on `mlx5`.
+- Safe private/shared handling for DMA registration is delegated to the guest's validated external converter device at `/dev/tdx_shmem`.
+- `td_tdx_map_shared_memory()` provides the shared-anonymous VMA, and `td_tdx_accept_shared_memory()` / `td_tdx_release_shared_memory()` drive the actual private/shared transition through that device.
+- The shared slot region is converted before MR registration and exposed as the remote-visible RDMA window.
+- Small control buffers are also converted and registered so the guest-side NIC never DMA-touches private pages.
+- `rdma_region_segment_bytes` is retained only for backward config compatibility and is currently unused by the slot-sized direct RDMA path.
+- This model assumes the guest has the external shared-memory convert path installed and validated, matching the `~/2026/share` prototype.
 
 ## Non-goals
 

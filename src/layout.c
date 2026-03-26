@@ -192,7 +192,12 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
         if (td_tdx_map_shared_memory(&region->shared.tdx, bytes, &mapped, err, err_len) != 0) {
             return -1;
         }
+        if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
+            td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
+            return -1;
+        }
         region->shared.anonymous_mapping = 1;
+        region->shared.shared_converted = 1;
         snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
     } else {
         region->shared.fd = open(cfg->memory_file, O_RDWR | O_CREAT, 0600);
@@ -244,6 +249,9 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
 void td_region_close(td_local_region_t *region) {
     td_region_free_private_slot_state(region);
     if (region->shared.base != NULL && region->shared.mapped_bytes > 0) {
+        if (region->shared.shared_converted) {
+            (void)td_tdx_release_shared_memory(&region->shared.tdx, region->shared.base, region->shared.mapped_bytes, NULL, 0);
+        }
         td_tdx_unmap_shared_memory(&region->shared.tdx, region->shared.base, region->shared.mapped_bytes);
     }
     if (region->shared.fd >= 0) {

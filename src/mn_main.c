@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
             td_region_backing_path(&region),
             (unsigned long long)td_region_shared_bytes(&region));
     }
-    fprintf(stdout, "dist-td mn runtime=%s shared_only_exposure=yes\n", td_tdx_runtime_name(td_region_tdx_runtime(&region)));
+    fprintf(stdout, "dist-td mn runtime=%s shared_region_exposure=direct private_metadata_exposure=no\n", td_tdx_runtime_name(td_region_tdx_runtime(&region)));
     td_print_memory_layout(&cfg, &region);
     fflush(stdout);
 
