@@ -19,7 +19,7 @@ COMMON_SRCS := \
 	$(SRC_DIR)/transport_tcp.c \
 	$(SRC_DIR)/transport_rdma.c
 
-all: $(BIN_DIR)/cn $(BIN_DIR)/mn $(BIN_DIR)/cn_bench
+all: $(BIN_DIR)/cn $(BIN_DIR)/mn $(BIN_DIR)/cn_bench $(BIN_DIR)/rdma_min
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -33,7 +33,10 @@ $(BIN_DIR)/mn: $(COMMON_SRCS) $(SRC_DIR)/mn_main.c | $(BIN_DIR)
 $(BIN_DIR)/cn_bench: $(COMMON_SRCS) $(BENCH_DIR)/cn_bench.c | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(COMMON_SRCS) $(BENCH_DIR)/cn_bench.c $(LDLIBS) -lm
 
+$(BIN_DIR)/rdma_min: $(SRC_DIR)/common.c $(SRC_DIR)/tdx.c $(BENCH_DIR)/rdma_min.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(SRC_DIR)/common.c $(SRC_DIR)/tdx.c $(BENCH_DIR)/rdma_min.c $(LDLIBS)
+
 clean:
-	rm -f $(BIN_DIR)/cn $(BIN_DIR)/mn $(BIN_DIR)/cn_bench
+	rm -f $(BIN_DIR)/cn $(BIN_DIR)/mn $(BIN_DIR)/cn_bench $(BIN_DIR)/rdma_min
 
 .PHONY: all clean
