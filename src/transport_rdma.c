@@ -639,6 +639,7 @@ static int td_rdma_qp_to_init(td_rdma_impl_t *impl, char *err, size_t err_len) {
 
 static int td_rdma_qp_to_rtr(td_rdma_impl_t *impl, const td_rdma_conn_info_t *remote, char *err, size_t err_len) {
     struct ibv_qp_attr attr;
+    int use_global = 0;
 
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
@@ -653,18 +654,28 @@ static int td_rdma_qp_to_rtr(td_rdma_impl_t *impl, const td_rdma_conn_info_t *re
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.port_num = (uint8_t)impl->port_num;
 
-    if (remote->lid == 0) {
+    use_global = remote->has_gid && impl->gid_index >= 0;
+    if (remote->lid == 0 && !use_global) {
         if (!remote->has_gid || impl->gid_index < 0) {
             td_format_error(err, err_len, "remote RDMA endpoint does not provide a routable LID or GID");
             return -1;
         }
+    }
+    if (use_global) {
         attr.ah_attr.is_global = 1;
         memcpy(&attr.ah_attr.grh.dgid, remote->gid, sizeof(attr.ah_attr.grh.dgid));
         attr.ah_attr.grh.sgid_index = (uint8_t)impl->gid_index;
-        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.hop_limit = 255;
         attr.ah_attr.grh.traffic_class = 0;
         attr.ah_attr.grh.flow_label = 0;
     }
+    fprintf(stderr,
+        "[RDMA-DEBUG] qp->RTR addressing dlid=%u use_global=%d sgid_index=%d hop_limit=%u\n",
+        attr.ah_attr.dlid,
+        attr.ah_attr.is_global,
+        attr.ah_attr.is_global ? attr.ah_attr.grh.sgid_index : -1,
+        attr.ah_attr.is_global ? attr.ah_attr.grh.hop_limit : 0);
+    fflush(stderr);
 
     if (ibv_modify_qp(impl->qp, &attr,
             IBV_QP_STATE |
