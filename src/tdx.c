@@ -263,6 +263,17 @@ int td_tdx_map_shared_memory(td_tdx_runtime_t *runtime, size_t bytes, void **out
         td_format_error(err, err_len, "shared memory mmap failed");
         return -1;
     }
+    /*
+     * The validated /dev/tdx_shmem prototype expects normal 4KB pages.
+     * Prevent THP promotion so later shared conversion does not hit a hugepage-backed VMA.
+     */
+#ifdef MADV_NOHUGEPAGE
+    if (madvise(mapped, bytes, MADV_NOHUGEPAGE) != 0) {
+        (void)munmap(mapped, bytes);
+        td_format_error(err, err_len, "MADV_NOHUGEPAGE failed for shared memory mapping");
+        return -1;
+    }
+#endif
     memset(mapped, 0, bytes);
 
     *out = mapped;
