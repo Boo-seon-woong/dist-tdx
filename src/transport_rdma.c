@@ -903,6 +903,17 @@ static int td_rdma_register_shared_buffer_mr(td_rdma_impl_t *impl, void *base, s
 }
 
 static int td_rdma_register_server_region(td_rdma_server_conn_t *conn, char *err, size_t err_len) {
+    if (conn->impl.data_mode != TD_RDMA_DATA_DIRECT) {
+        fprintf(stderr,
+            "[MN-INFO] rdma_data_mode=%s; skipping shared region MR registration and using control-plane fallback\n",
+            td_rdma_data_mode_name(conn->impl.data_mode));
+        fflush(stderr);
+        if (err != NULL && err_len > 0) {
+            err[0] = '\0';
+        }
+        return 0;
+    }
+
     if (conn->impl.tdx.enabled == TD_TDX_ON && !conn->region->shared.shared_converted) {
         fprintf(stderr,
             "[MN-INFO] TDX guest keeps the slot region private; using SEND/RECV path for READ/WRITE to avoid startup conversion failures\n");
