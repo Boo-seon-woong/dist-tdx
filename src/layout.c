@@ -179,6 +179,7 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     size_t bytes = td_region_required_bytes(cfg);
     void *mapped;
     td_region_header_t *header;
+    int force_shared_region = 0;
 
     memset(region, 0, sizeof(*region));
     region->shared.fd = -1;
@@ -188,21 +189,34 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     }
 
     if (cfg->transport == TD_TRANSPORT_RDMA) {
-        mapped = NULL;
-        if (td_tdx_map_shared_memory(&region->shared.tdx, bytes, &mapped, err, err_len) != 0) {
-            return -1;
+        force_shared_region = cfg->tdx == TD_TDX_ON &&
+            getenv("DISTTDX_FORCE_SHARED_REGION") != NULL &&
+            strcmp(getenv("DISTTDX_FORCE_SHARED_REGION"), "0") != 0;
+        if (cfg->tdx == TD_TDX_ON && !force_shared_region) {
+            mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            region->shared.anonymous_mapping = 1;
+            region->shared.shared_converted = 0;
+            snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-private]");
+            fprintf(stderr,
+                "[MN-INFO] leaving slot region private by default; set DISTTDX_FORCE_SHARED_REGION=1 to force full shared conversion\n");
+            fflush(stderr);
+        } else {
+            mapped = NULL;
+            if (td_tdx_map_shared_memory(&region->shared.tdx, bytes, &mapped, err, err_len) != 0) {
+                return -1;
+            }
+            fprintf(stderr, "[MN-DEBUG] shared region mapped base=%p bytes=%zu\n", mapped, bytes);
+            fflush(stderr);
+            if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
+                td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
+                return -1;
+            }
+            fprintf(stderr, "[MN-DEBUG] shared region converted base=%p bytes=%zu\n", mapped, bytes);
+            fflush(stderr);
+            region->shared.anonymous_mapping = 1;
+            region->shared.shared_converted = 1;
+            snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
         }
-        fprintf(stderr, "[MN-DEBUG] shared region mapped base=%p bytes=%zu\n", mapped, bytes);
-        fflush(stderr);
-        if (td_tdx_accept_shared_memory(&region->shared.tdx, mapped, bytes, err, err_len) != 0) {
-            td_tdx_unmap_shared_memory(&region->shared.tdx, mapped, bytes);
-            return -1;
-        }
-        fprintf(stderr, "[MN-DEBUG] shared region converted base=%p bytes=%zu\n", mapped, bytes);
-        fflush(stderr);
-        region->shared.anonymous_mapping = 1;
-        region->shared.shared_converted = 1;
-        snprintf(region->shared.backing_path, sizeof(region->shared.backing_path), "%s", "[anonymous-shm]");
     } else {
         region->shared.fd = open(cfg->memory_file, O_RDWR | O_CREAT, 0600);
         if (region->shared.fd < 0) {
